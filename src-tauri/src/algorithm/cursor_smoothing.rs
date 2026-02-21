@@ -48,11 +48,16 @@ pub fn smooth_cursor_points(points: &[CursorPoint], smoothing_factor: f64) -> Ve
         return points.to_vec();
     }
 
+    let resampled = resample_points(points, 120.0);
+    if resampled.len() < 2 {
+        return resampled;
+    }
+
     let window = (3.0 + (factor * 2.0).round()) as usize;
-    let filtered = simple_moving_average_filter(points, window.clamp(3, 5));
+    let filtered = simple_moving_average_filter(&resampled, window.clamp(3, 5));
     let samples_per_segment = ((2.0 + factor * 6.0).round() as usize).max(2);
     let interpolated = catmull_rom_interpolate_impl(&filtered, samples_per_segment);
-    snap_click_points(interpolated, points)
+    snap_click_points(interpolated, &resampled)
 }
 
 /// Kept for compatibility with previous API.
@@ -68,6 +73,105 @@ pub fn catmull_rom_interpolate(
     samples_per_segment: usize,
 ) -> Vec<CursorPoint> {
     catmull_rom_interpolate_impl(points, samples_per_segment)
+}
+
+fn resample_points(points: &[CursorPoint], hz: f64) -> Vec<CursorPoint> {
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+
+    let safe_hz = if hz.is_finite() {
+        hz.clamp(30.0, 240.0)
+    } else {
+        120.0
+    };
+    let step_ms = 1_000.0 / safe_hz;
+    let mut sorted = dedupe_points(points.to_vec());
+    if sorted.len() < 2 {
+        return sorted;
+    }
+
+    sorted.sort_by_key(|point| point.ts);
+    let start_ts = sorted.first().map(|point| point.ts).unwrap_or(0);
+    let end_ts = sorted.last().map(|point| point.ts).unwrap_or(start_ts);
+    if end_ts <= start_ts {
+        return sorted;
+    }
+
+    let mut sample_ts: Vec<u64> = Vec::new();
+    let mut t = start_ts as f64;
+    let end_f = end_ts as f64;
+    while t < end_f {
+        sample_ts.push(t.round() as u64);
+        t += step_ms;
+    }
+    sample_ts.push(end_ts);
+    for click in sorted.iter().filter(|point| point.is_click) {
+        sample_ts.push(click.ts);
+    }
+    sample_ts.sort_unstable();
+    sample_ts.dedup();
+
+    let mut result: Vec<CursorPoint> = Vec::with_capacity(sample_ts.len());
+    let mut segment_index = 0usize;
+    for ts in sample_ts {
+        let mut point = sample_at_ts(&sorted, ts, &mut segment_index);
+        point.is_click = sorted
+            .iter()
+            .any(|original| original.is_click && original.ts == ts);
+        result.push(point);
+    }
+
+    dedupe_points(result)
+}
+
+fn sample_at_ts(points: &[CursorPoint], ts: u64, segment_index: &mut usize) -> CursorPoint {
+    if points.is_empty() {
+        return CursorPoint {
+            ts,
+            x: 0.0,
+            y: 0.0,
+            is_click: false,
+        };
+    }
+
+    if ts <= points[0].ts {
+        let mut point = points[0];
+        point.ts = ts;
+        point.is_click = false;
+        return point;
+    }
+
+    let last = points[points.len() - 1];
+    if ts >= last.ts {
+        let mut point = last;
+        point.ts = ts;
+        point.is_click = false;
+        return point;
+    }
+
+    while *segment_index + 1 < points.len() && points[*segment_index + 1].ts < ts {
+        *segment_index += 1;
+    }
+    let left = points[*segment_index];
+    let right = points[(*segment_index + 1).min(points.len() - 1)];
+
+    if right.ts <= left.ts {
+        return CursorPoint {
+            ts,
+            x: right.x,
+            y: right.y,
+            is_click: false,
+        };
+    }
+
+    let ratio = (ts.saturating_sub(left.ts) as f64 / (right.ts - left.ts) as f64).clamp(0.0, 1.0);
+    CursorPoint {
+        ts,
+        x: left.x + (right.x - left.x) * ratio,
+        y: left.y + (right.y - left.y) * ratio,
+        is_click: false,
+    }
 }
 
 fn simple_moving_average_filter(points: &[CursorPoint], window_size: usize) -> Vec<CursorPoint> {
@@ -139,11 +243,8 @@ fn catmull_rom_interpolate_impl(
         let t2 = next_knot(t1, p1, p2, ALPHA);
         let t3 = next_knot(t2, p2, p3, ALPHA);
 
+        let mut curve_points: Vec<(f64, f64)> = Vec::with_capacity(samples + 1);
         for step in 0..=samples {
-            if idx > 0 && step == 0 {
-                continue;
-            }
-
             let ratio = step as f64 / samples as f64;
             let t = t1 + (t2 - t1) * ratio;
 
@@ -152,15 +253,36 @@ fn catmull_rom_interpolate_impl(
             let a3 = interpolate_point(p2, p3, t2, t3, t);
             let b1 = interpolate_xy(a1, a2, t0, t2, t);
             let b2 = interpolate_xy(a2, a3, t1, t3, t);
-            let c = interpolate_xy(b1, b2, t1, t2, t);
+            curve_points.push(interpolate_xy(b1, b2, t1, t2, t));
+        }
 
+        let mut cumulative = vec![0.0f64; curve_points.len()];
+        for step in 1..curve_points.len() {
+            let prev = curve_points[step - 1];
+            let current = curve_points[step];
+            cumulative[step] =
+                cumulative[step - 1] + (current.0 - prev.0).hypot(current.1 - prev.1);
+        }
+        let total_len = cumulative.last().copied().unwrap_or(0.0);
+
+        for step in 0..=samples {
+            if idx > 0 && step == 0 {
+                continue;
+            }
+
+            let position = curve_points[step];
+            let ratio = if total_len <= 1e-9 {
+                step as f64 / samples as f64
+            } else {
+                cumulative[step] / total_len
+            };
             let ts = lerp_ts(p1.ts, p2.ts, ratio);
             let is_click = (step == 0 && p1.is_click) || (step == samples && p2.is_click);
 
             result.push(CursorPoint {
                 ts,
-                x: c.0,
-                y: c.1,
+                x: position.0,
+                y: position.1,
                 is_click,
             });
         }
@@ -342,5 +464,37 @@ mod tests {
         assert!((click_point.x - 50.0).abs() < 0.0001);
         assert!((click_point.y - 40.0).abs() < 0.0001);
         assert!(click_point.is_click);
+    }
+
+    #[test]
+    fn resampler_generates_stable_time_grid() {
+        let points = vec![
+            CursorPoint {
+                ts: 0,
+                x: 0.0,
+                y: 0.0,
+                is_click: false,
+            },
+            CursorPoint {
+                ts: 37,
+                x: 100.0,
+                y: 0.0,
+                is_click: false,
+            },
+            CursorPoint {
+                ts: 142,
+                x: 200.0,
+                y: 50.0,
+                is_click: false,
+            },
+        ];
+
+        let resampled = resample_points(&points, 120.0);
+        assert!(resampled.len() > points.len());
+        let deltas: Vec<u64> = resampled
+            .windows(2)
+            .map(|pair| pair[1].ts.saturating_sub(pair[0].ts))
+            .collect();
+        assert!(deltas.iter().all(|delta| *delta >= 7 && *delta <= 10));
     }
 }

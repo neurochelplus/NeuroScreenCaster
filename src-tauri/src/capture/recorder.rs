@@ -5,8 +5,9 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::HMONITOR;
@@ -29,6 +30,7 @@ use windows_capture::{
 
 /// Target FPS for capture/output.
 pub const TARGET_FPS: u32 = 30;
+const HNS_PER_SECOND: i64 = 10_000_000;
 
 #[derive(Clone, Debug)]
 pub struct CaptureEncoderSettings {
@@ -44,21 +46,153 @@ pub struct CaptureFlags {
     pub encoder: CaptureEncoderSettings,
 }
 
+#[derive(Clone)]
+struct LatestFrame {
+    pixels: Arc<[u8]>,
+    sequence: u64,
+}
+
+#[derive(Default)]
+struct FrameSlot {
+    latest: Option<LatestFrame>,
+    next_sequence: u64,
+}
+
+#[derive(Default)]
+struct MuxerStats {
+    encoded_frames: u64,
+    duplicated_frames: u64,
+}
+
 pub struct ScreenRecorder {
     stop_flag: Arc<AtomicBool>,
-    encoder: Option<VideoEncoder>,
-    encoded_frames: u64,
+    frame_slot: Arc<(Mutex<FrameSlot>, Condvar)>,
+    muxer_thread: Option<JoinHandle<Result<MuxerStats, Box<dyn std::error::Error + Send + Sync>>>>,
+    received_frames: u64,
 }
 
 impl ScreenRecorder {
-    fn finish_encoder(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(encoder) = self.encoder.take() {
-            encoder
-                .finish()
-                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+    fn finish_encoder(&mut self) -> Result<MuxerStats, Box<dyn std::error::Error + Send + Sync>> {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        let (_, cvar) = &*self.frame_slot;
+        cvar.notify_all();
+
+        if let Some(muxer_thread) = self.muxer_thread.take() {
+            let stats = muxer_thread
+                .join()
+                .map_err(|_| std::io::Error::other("CFR muxer thread panicked"))??;
+            return Ok(stats);
         }
-        Ok(())
+
+        Ok(MuxerStats::default())
     }
+}
+
+fn run_cfr_muxer(
+    mut encoder: VideoEncoder,
+    stop_flag: Arc<AtomicBool>,
+    frame_slot: Arc<(Mutex<FrameSlot>, Condvar)>,
+    target_fps: u32,
+) -> Result<MuxerStats, Box<dyn std::error::Error + Send + Sync>> {
+    let safe_fps = target_fps.max(1) as u64;
+    let frame_interval_hns = (HNS_PER_SECOND / safe_fps as i64).max(1);
+    let frame_interval = Duration::from_nanos((1_000_000_000u64 / safe_fps).max(1));
+
+    let (lock, cvar) = &*frame_slot;
+    let mut stats = MuxerStats::default();
+    let mut active_frame: Option<LatestFrame> = None;
+    let mut last_sequence = 0u64;
+    let mut frame_index = 0i64;
+    let mut next_tick: Option<Instant> = None;
+
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+
+        if active_frame.is_none() {
+            let mut guard = lock
+                .lock()
+                .map_err(|_| std::io::Error::other("CFR frame slot lock poisoned"))?;
+            if guard.latest.is_none() {
+                let (next_guard, _) = cvar
+                    .wait_timeout(guard, Duration::from_millis(50))
+                    .map_err(|_| std::io::Error::other("CFR frame slot wait poisoned"))?;
+                guard = next_guard;
+            }
+            if let Some(snapshot) = guard.latest.clone() {
+                last_sequence = snapshot.sequence;
+                active_frame = Some(snapshot);
+                next_tick = Some(Instant::now());
+            }
+            continue;
+        }
+
+        let deadline = next_tick.unwrap_or_else(Instant::now);
+        let now = Instant::now();
+        if now < deadline {
+            thread::sleep(deadline - now);
+            continue;
+        }
+
+        {
+            let guard = lock
+                .lock()
+                .map_err(|_| std::io::Error::other("CFR frame slot lock poisoned"))?;
+            if let Some(snapshot) = guard.latest.clone() {
+                if snapshot.sequence != last_sequence {
+                    last_sequence = snapshot.sequence;
+                    active_frame = Some(snapshot);
+                } else if stats.encoded_frames > 0 {
+                    stats.duplicated_frames = stats.duplicated_frames.saturating_add(1);
+                }
+            } else if stats.encoded_frames > 0 {
+                stats.duplicated_frames = stats.duplicated_frames.saturating_add(1);
+            }
+        }
+
+        if let Some(snapshot) = active_frame.as_ref() {
+            let pts_hns = frame_index.saturating_mul(frame_interval_hns);
+            encoder
+                .send_frame_buffer(snapshot.pixels.as_ref(), pts_hns)
+                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+            frame_index = frame_index.saturating_add(1);
+            stats.encoded_frames = stats.encoded_frames.saturating_add(1);
+        }
+
+        let mut candidate = deadline + frame_interval;
+        let now_after = Instant::now();
+        while candidate <= now_after {
+            candidate += frame_interval;
+        }
+        next_tick = Some(candidate);
+    }
+
+    encoder
+        .finish()
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+    Ok(stats)
+}
+
+fn normalize_frame_for_encoder(buffer: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let pixel_count = width.saturating_mul(height);
+    let expected_len = pixel_count.saturating_mul(4);
+    if pixel_count == 0 || buffer.len() < expected_len {
+        return buffer.to_vec();
+    }
+
+    // `send_frame_buffer` expects bottom-to-top row order.
+    // Convert from top-to-bottom buffer by flipping rows only.
+    let row_bytes = width.saturating_mul(4);
+    let mut normalized = vec![0u8; expected_len];
+    for row in 0..height {
+        let src_row = height - 1 - row;
+        let src_start = src_row.saturating_mul(row_bytes);
+        let dst_start = row.saturating_mul(row_bytes);
+        normalized[dst_start..dst_start + row_bytes]
+            .copy_from_slice(&buffer[src_start..src_start + row_bytes]);
+    }
+    normalized
 }
 
 impl GraphicsCaptureApiHandler for ScreenRecorder {
@@ -88,10 +222,19 @@ impl GraphicsCaptureApiHandler for ScreenRecorder {
             )
         })?;
 
+        let frame_slot = Arc::new((Mutex::new(FrameSlot::default()), Condvar::new()));
+        let muxer_stop_flag = flags.stop_flag.clone();
+        let muxer_slot = frame_slot.clone();
+        let muxer_thread = thread::Builder::new()
+            .name("nsc-cfr-muxer".to_string())
+            .spawn(move || run_cfr_muxer(encoder, muxer_stop_flag, muxer_slot, target_fps))
+            .map_err(|err| format!("Failed to spawn CFR muxer thread: {err}"))?;
+
         Ok(Self {
             stop_flag: flags.stop_flag,
-            encoder: Some(encoder),
-            encoded_frames: 0,
+            frame_slot,
+            muxer_thread: Some(muxer_thread),
+            received_frames: 0,
         })
     }
 
@@ -105,20 +248,42 @@ impl GraphicsCaptureApiHandler for ScreenRecorder {
             return Ok(());
         }
 
-        if let Some(encoder) = self.encoder.as_mut() {
-            if let Err(err) = encoder.send_frame(frame) {
-                control.stop();
-                return Err(Box::new(err));
-            }
-            self.encoded_frames = self.encoded_frames.saturating_add(1);
+        let width = frame.width() as usize;
+        let height = frame.height() as usize;
+        let mut frame_buffer = frame
+            .buffer()
+            .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+        let bytes = frame_buffer
+            .as_nopadding_buffer()
+            .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+        let normalized = normalize_frame_for_encoder(bytes, width, height);
+        let pixels: Arc<[u8]> = Arc::from(normalized);
+
+        let (lock, cvar) = &*self.frame_slot;
+        {
+            let mut slot = lock
+                .lock()
+                .map_err(|_| std::io::Error::other("CFR frame slot lock poisoned"))?;
+            slot.next_sequence = slot.next_sequence.saturating_add(1);
+            slot.latest = Some(LatestFrame {
+                pixels,
+                sequence: slot.next_sequence,
+            });
         }
+        cvar.notify_all();
+        self.received_frames = self.received_frames.saturating_add(1);
 
         Ok(())
     }
 
     fn on_closed(&mut self) -> Result<(), Self::Error> {
-        self.finish_encoder()?;
-        log::info!("capture closed: encoded_frames={}", self.encoded_frames);
+        let stats = self.finish_encoder()?;
+        log::info!(
+            "capture closed: received_frames={} encoded_frames={} duplicated_frames={}",
+            self.received_frames,
+            stats.encoded_frames,
+            stats.duplicated_frames
+        );
         Ok(())
     }
 }

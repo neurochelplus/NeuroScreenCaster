@@ -91,6 +91,8 @@ export interface Project {
   createdAt: number;
   /** Путь к сырому видеофайлу относительно папки проекта. */
   videoPath: string;
+  /** Путь к прокси-видео для монтажа (опционально). */
+  proxyVideoPath?: string;
   /** Путь к events.json относительно папки проекта. */
   eventsPath: string;
   /** Длительность записи (мс). */

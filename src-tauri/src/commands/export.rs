@@ -1451,6 +1451,7 @@ mod tests {
             name: "Test".to_string(),
             created_at: 0,
             video_path: "raw.mp4".to_string(),
+            proxy_video_path: None,
             events_path: "events.json".to_string(),
             duration_ms: 10_000,
             video_width: 1920,

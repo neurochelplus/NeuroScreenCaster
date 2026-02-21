@@ -175,6 +175,8 @@ pub struct Project {
     pub created_at: u64,
     /// Путь к сырому видеофайлу относительно папки проекта.
     pub video_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_video_path: Option<String>,
     /// Путь к файлу событий относительно папки проекта.
     pub events_path: String,
     /// Длительность записи (мс).

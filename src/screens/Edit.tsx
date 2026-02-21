@@ -858,7 +858,12 @@ export default function EditScreen() {
     let isCancelled = false;
 
     const resolveVideoSrc = async () => {
-      if (!project || !loadedProjectPath || !project.videoPath.trim()) {
+      const preferredVideoPath =
+        project?.proxyVideoPath?.trim() && project.proxyVideoPath.trim().length > 0
+          ? project.proxyVideoPath.trim()
+          : project?.videoPath?.trim() ?? "";
+
+      if (!project || !loadedProjectPath || !preferredVideoPath) {
         setVideoSrc(null);
         setVideoDurationMs(null);
         setVideoError(null);
@@ -866,7 +871,7 @@ export default function EditScreen() {
       }
 
       try {
-        const sourcePath = project.videoPath.trim();
+        const sourcePath = preferredVideoPath;
         const absoluteSourcePath = (await isAbsolute(sourcePath))
           ? sourcePath
           : await join(await dirname(loadedProjectPath), sourcePath);
@@ -890,7 +895,7 @@ export default function EditScreen() {
     return () => {
       isCancelled = true;
     };
-  }, [project?.videoPath, loadedProjectPath]);
+  }, [project?.proxyVideoPath, project?.videoPath, loadedProjectPath]);
 
   useEffect(() => {
     playheadStateRef.current = playheadMs;

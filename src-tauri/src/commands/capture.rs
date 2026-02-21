@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::algorithm::{auto_zoom, cursor_smoothing};
-use crate::capture::recorder::{get_monitor_scale_factor, get_monitor_size, start_capture};
+use crate::capture::recorder::{
+    find_ffmpeg_exe, get_monitor_scale_factor, get_monitor_size, start_capture,
+};
 use crate::capture::state::{ActiveRecording, RecorderState};
 use crate::models::events::{EventsFile, InputEvent, SCHEMA_VERSION as EVENTS_VERSION};
 use crate::models::project::{
@@ -161,11 +163,19 @@ fn save_recording_files(
     );
     let smoothed_cursor_path =
         cursor_smoothing::smooth_cursor_path(&events, settings.cursor.smoothing_factor);
+    let proxy_video_path = match build_editor_proxy(output_dir) {
+        Ok(path) => path,
+        Err(err) => {
+            log::warn!("save_recording_files: failed to build proxy video: {err}");
+            None
+        }
+    };
 
     log::info!(
-        "save_recording_files: auto_zoom_segments={} smoothed_cursor_points={}",
+        "save_recording_files: auto_zoom_segments={} smoothed_cursor_points={} proxy={}",
         zoom_segments.len(),
-        smoothed_cursor_path.len()
+        smoothed_cursor_path.len(),
+        proxy_video_path.as_deref().unwrap_or("none")
     );
 
     let project = Project {
@@ -174,6 +184,7 @@ fn save_recording_files(
         name: format_recording_name(start_ms),
         created_at: start_ms,
         video_path: "raw.mp4".to_string(),
+        proxy_video_path,
         events_path: "events.json".to_string(),
         duration_ms,
         video_width: width,
@@ -203,6 +214,51 @@ fn save_recording_files(
         .map_err(|e| format!("Failed to write events.json: {e}"))?;
 
     Ok(())
+}
+
+fn build_editor_proxy(output_dir: &std::path::Path) -> Result<Option<String>, String> {
+    let source = output_dir.join("raw.mp4");
+    if !source.exists() {
+        return Ok(None);
+    }
+
+    let ffmpeg = find_ffmpeg_exe();
+    let proxy_name = "proxy-edit.mp4";
+    let proxy_path = output_dir.join(proxy_name);
+
+    let status = std::process::Command::new(&ffmpeg)
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(&source)
+        .arg("-an")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("veryfast")
+        .arg("-crf")
+        .arg("17")
+        .arg("-g")
+        .arg("15")
+        .arg("-keyint_min")
+        .arg("15")
+        .arg("-sc_threshold")
+        .arg("0")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(&proxy_path)
+        .status()
+        .map_err(|e| format!("Failed to run ffmpeg ({}) for proxy: {e}", ffmpeg.display()))?;
+
+    if !status.success() {
+        return Ok(None);
+    }
+
+    Ok(Some(proxy_name.to_string()))
 }
 
 fn format_recording_name(start_ms: u64) -> String {
