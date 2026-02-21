@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { dirname, isAbsolute, join } from "@tauri-apps/api/path";
 import type { EventsFile } from "../types/events";
@@ -69,7 +69,7 @@ const FULL_RECT: NormalizedRect = { x: 0, y: 0, width: 1, height: 1 };
 const DEFAULT_SPRING: CameraSpring = { mass: 1, stiffness: 170, damping: 26 };
 const MIN_RECT_SIZE = 0.05;
 const MIN_SEGMENT_MS = 200;
-const PLAYHEAD_SYNC_THRESHOLD_MS = 12;
+const PLAYHEAD_STATE_SYNC_INTERVAL_MS = 120;
 const PREVIEW_SPRING_FPS = 60;
 
 function clamp(value: number, min: number, max: number): number {
@@ -548,9 +548,15 @@ export default function EditScreen() {
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const previewStageRef = useRef<HTMLDivElement | null>(null);
+  const previewCanvasRef = useRef<HTMLDivElement | null>(null);
+  const cursorRef = useRef<HTMLDivElement | null>(null);
+  const timelinePlayheadRef = useRef<HTMLDivElement | null>(null);
   const timelineViewportRef = useRef<HTMLDivElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const dragStateRef = useRef<SegmentDragState | null>(null);
+  const playheadRef = useRef(0);
+  const playheadStateRef = useRef(0);
+  const lastStateSyncAtRef = useRef(0);
 
   const timelineDurationMs = project?.durationMs ?? 0;
   const previewDurationMs = useMemo(() => {
@@ -559,11 +565,6 @@ export default function EditScreen() {
     }
     return Math.round(videoDurationMs);
   }, [timelineDurationMs, videoDurationMs]);
-
-  const playheadTimelineMs = useMemo(
-    () => mapTimeMs(playheadMs, previewDurationMs, timelineDurationMs),
-    [playheadMs, previewDurationMs, timelineDurationMs]
-  );
 
   const previewAspectRatio = useMemo(() => {
     if (!project || project.videoHeight <= 0) {
@@ -604,7 +605,6 @@ export default function EditScreen() {
   }, [previewDurationMs, timelineViewportWidthPx, timelineZoom]);
 
   const pxPerPreviewMs = timelineContentWidthPx / Math.max(previewDurationMs, 1);
-  const playheadLeftPx = clamp(playheadMs * pxPerPreviewMs, 0, timelineContentWidthPx);
 
   const timelineSegments = useMemo(
     () => sortSegments(project?.timeline.zoomSegments ?? []),
@@ -650,23 +650,60 @@ export default function EditScreen() {
     () => buildSpringCameraTrack(runtimeSegments, timelineDurationMs),
     [runtimeSegments, timelineDurationMs]
   );
-  const previewRect = useMemo(
-    () => sampleCameraTrack(previewCameraTrack, playheadTimelineMs),
-    [previewCameraTrack, playheadTimelineMs]
-  );
-  const previewScale = 1 / Math.max(previewRect.width, previewRect.height);
-  const centerX = previewRect.x + previewRect.width / 2;
-  const centerY = previewRect.y + previewRect.height / 2;
-  const previewTranslateX = (0.5 - centerX * previewScale) * 100;
-  const previewTranslateY = (0.5 - centerY * previewScale) * 100;
 
   const cursorSamples = useMemo(
     () => extractCursorSamples(eventsFile, project?.settings.cursor.smoothingFactor ?? 0.8),
     [eventsFile, project?.settings.cursor.smoothingFactor]
   );
-  const cursorPosition = useMemo(
-    () => interpolateCursor(cursorSamples, playheadTimelineMs),
-    [cursorSamples, playheadTimelineMs]
+
+  const renderPreviewFrame = useCallback(
+    (previewMs: number) => {
+      if (previewDurationMs <= 0 || timelineDurationMs <= 0) {
+        return;
+      }
+
+      const clampedPreviewMs = clamp(previewMs, 0, previewDurationMs);
+      playheadRef.current = clampedPreviewMs;
+      const timelineMs = mapTimeMs(clampedPreviewMs, previewDurationMs, timelineDurationMs);
+      const rect = sampleCameraTrack(previewCameraTrack, timelineMs);
+      const scale = 1 / Math.max(rect.width, rect.height);
+      const centerX = rect.x + rect.width / 2;
+      const centerY = rect.y + rect.height / 2;
+
+      if (previewCanvasRef.current) {
+        const txPx = (0.5 - centerX * scale) * previewFrameSize.width;
+        const tyPx = (0.5 - centerY * scale) * previewFrameSize.height;
+        previewCanvasRef.current.style.transform = `translate3d(${txPx.toFixed(
+          3
+        )}px, ${tyPx.toFixed(3)}px, 0) scale(${scale.toFixed(6)})`;
+      }
+
+      if (cursorRef.current) {
+        const cursor = interpolateCursor(cursorSamples, timelineMs);
+        const cursorX = cursor.x * previewFrameSize.width;
+        const cursorY = cursor.y * previewFrameSize.height;
+        cursorRef.current.style.transform = `translate3d(${cursorX.toFixed(
+          3
+        )}px, ${cursorY.toFixed(3)}px, 0) translate(-50%, -50%)`;
+      }
+
+      if (timelinePlayheadRef.current) {
+        const leftPx = clamp(clampedPreviewMs * pxPerPreviewMs, 0, timelineContentWidthPx);
+        timelinePlayheadRef.current.style.transform = `translate3d(${(leftPx - 1).toFixed(
+          2
+        )}px, 0, 0)`;
+      }
+    },
+    [
+      cursorSamples,
+      previewCameraTrack,
+      previewDurationMs,
+      previewFrameSize.height,
+      previewFrameSize.width,
+      pxPerPreviewMs,
+      timelineContentWidthPx,
+      timelineDurationMs,
+    ]
   );
 
   const segmentVisuals = useMemo<TimelineSegmentVisual[]>(() => {
@@ -760,6 +797,8 @@ export default function EditScreen() {
       });
       setEventsFile(loadedEvents);
       setSelectedSegmentId(sorted[0]?.id ?? null);
+      playheadRef.current = 0;
+      playheadStateRef.current = 0;
       setPlayheadMs(0);
       setTimelineZoom(1);
       setVideoDurationMs(null);
@@ -851,7 +890,11 @@ export default function EditScreen() {
   }, [project?.videoPath, loadedProjectPath]);
 
   useEffect(() => {
-    if (!videoRef.current || previewDurationMs <= 0) {
+    playheadStateRef.current = playheadMs;
+  }, [playheadMs]);
+
+  useEffect(() => {
+    if (!videoRef.current || previewDurationMs <= 0 || isVideoPlaying) {
       return;
     }
 
@@ -860,13 +903,17 @@ export default function EditScreen() {
     if (Math.abs(video.currentTime - targetTimeSec) > 0.05) {
       video.currentTime = targetTimeSec;
     }
-  }, [playheadMs, previewDurationMs]);
+  }, [isVideoPlaying, playheadMs, previewDurationMs]);
 
   useEffect(() => {
     if (previewDurationMs <= 0) {
       return;
     }
-    setPlayheadMs((current) => clamp(current, 0, previewDurationMs));
+    setPlayheadMs((current) => {
+      const clamped = clamp(current, 0, previewDurationMs);
+      playheadRef.current = clamped;
+      return clamped;
+    });
   }, [previewDurationMs]);
 
   useEffect(() => {
@@ -882,13 +929,21 @@ export default function EditScreen() {
       }
 
       const nextMs = clamp(Math.round(video.currentTime * 1000), 0, previewDurationMs);
-      setPlayheadMs((current) =>
-        Math.abs(current - nextMs) >= PLAYHEAD_SYNC_THRESHOLD_MS ? nextMs : current
-      );
+      renderPreviewFrame(nextMs);
+
+      const now = performance.now();
+      if (
+        now - lastStateSyncAtRef.current >= PLAYHEAD_STATE_SYNC_INTERVAL_MS ||
+        Math.abs(nextMs - playheadStateRef.current) >= PLAYHEAD_STATE_SYNC_INTERVAL_MS
+      ) {
+        lastStateSyncAtRef.current = now;
+        setPlayheadMs(nextMs);
+      }
 
       rafRef.current = requestAnimationFrame(updateFromVideo);
     };
 
+    lastStateSyncAtRef.current = performance.now();
     rafRef.current = requestAnimationFrame(updateFromVideo);
 
     return () => {
@@ -897,7 +952,11 @@ export default function EditScreen() {
         rafRef.current = null;
       }
     };
-  }, [isVideoPlaying, previewDurationMs]);
+  }, [isVideoPlaying, previewDurationMs, renderPreviewFrame]);
+
+  useEffect(() => {
+    renderPreviewFrame(playheadRef.current || playheadMs);
+  }, [playheadMs, renderPreviewFrame]);
 
   useEffect(() => {
     const viewport = timelineViewportRef.current;
@@ -1037,10 +1096,15 @@ export default function EditScreen() {
       return;
     }
 
-    const startTs = clamp(playheadTimelineMs, 0, Math.max(0, timelineDurationMs - MIN_SEGMENT_MS));
+    const livePlayheadTimelineMs = mapTimeMs(playheadRef.current, previewDurationMs, timelineDurationMs);
+    const startTs = clamp(
+      livePlayheadTimelineMs,
+      0,
+      Math.max(0, timelineDurationMs - MIN_SEGMENT_MS)
+    );
     const endTs = clamp(startTs + 1600, startTs + MIN_SEGMENT_MS, timelineDurationMs);
     const nextId = `manual-${Date.now()}`;
-    const rect = previewRect ?? DEFAULT_RECT;
+    const rect = sampleCameraTrack(previewCameraTrack, livePlayheadTimelineMs) ?? DEFAULT_RECT;
 
     const newSegment: ZoomSegment = {
       id: nextId,
@@ -1095,14 +1159,16 @@ export default function EditScreen() {
 
   const seekToPreviewMs = (nextMs: number) => {
     const clampedMs = clamp(nextMs, 0, previewDurationMs);
+    playheadRef.current = clampedMs;
     setPlayheadMs(clampedMs);
+    renderPreviewFrame(clampedMs);
     if (videoRef.current) {
       videoRef.current.currentTime = clampedMs / 1000;
     }
   };
 
   const seekBy = (deltaMs: number) => {
-    seekToPreviewMs(playheadMs + deltaMs);
+    seekToPreviewMs(playheadRef.current + deltaMs);
   };
 
   const togglePlayback = async () => {
@@ -1352,12 +1418,7 @@ export default function EditScreen() {
                       : undefined
                   }
                 >
-                  <div
-                    className="preview-canvas"
-                    style={{
-                      transform: `translate(${previewTranslateX}%, ${previewTranslateY}%) scale(${previewScale})`,
-                    }}
-                  >
+                  <div className="preview-canvas" ref={previewCanvasRef}>
                     {videoSrc ? (
                       <video
                         ref={videoRef}
@@ -1380,16 +1441,17 @@ export default function EditScreen() {
                           }
                         }}
                         onTimeUpdate={(event) => {
+                          if (isVideoPlaying) {
+                            return;
+                          }
                           const nextMs = clamp(
                             Math.round(event.currentTarget.currentTime * 1000),
                             0,
                             previewDurationMs
                           );
-                          setPlayheadMs((current) =>
-                            Math.abs(current - nextMs) >= PLAYHEAD_SYNC_THRESHOLD_MS
-                              ? nextMs
-                              : current
-                          );
+                          playheadRef.current = nextMs;
+                          setPlayheadMs(nextMs);
+                          renderPreviewFrame(nextMs);
                         }}
                         onSeeking={(event) => {
                           const nextMs = clamp(
@@ -1397,7 +1459,9 @@ export default function EditScreen() {
                             0,
                             previewDurationMs
                           );
+                          playheadRef.current = nextMs;
                           setPlayheadMs(nextMs);
+                          renderPreviewFrame(nextMs);
                         }}
                         onError={() =>
                           setVideoError("Failed to load project video. Check file availability and asset scope.")
@@ -1409,10 +1473,9 @@ export default function EditScreen() {
 
                     <div className="preview-overlay-grid" />
                     <div
+                      ref={cursorRef}
                       className="preview-cursor"
                       style={{
-                        left: `${cursorPosition.x * 100}%`,
-                        top: `${cursorPosition.y * 100}%`,
                         width: `${project.settings.cursor.size * 16}px`,
                         height: `${project.settings.cursor.size * 16}px`,
                         background: project.settings.cursor.color,
@@ -1523,7 +1586,7 @@ export default function EditScreen() {
                     </div>
                   </div>
 
-                  <div className="timeline-playhead" style={{ left: `${playheadLeftPx}px` }} />
+                  <div className="timeline-playhead" ref={timelinePlayheadRef} />
                 </div>
               </div>
             </div>

@@ -24,9 +24,12 @@ pub struct AutoZoomConfig {
     pub max_ui_rect_area_ratio: f64,
     pub missing_control_max_area_ratio: f64,
     pub missing_control_max_side_ratio: f64,
-    pub scroll_target_step_ratio: f64,
-    pub micro_track_cursor_weight: f64,
-    pub micro_track_sample_ms: u64,
+    pub focus_sample_ms: u64,
+    pub focus_base_follow: f64,
+    pub focus_energy_follow: f64,
+    pub focus_energy_rise: f64,
+    pub focus_energy_decay_per_ms: f64,
+    pub segment_stitch_gap_ms: u64,
     pub spring_mass: f64,
     pub spring_stiffness: f64,
     pub spring_damping: f64,
@@ -56,9 +59,12 @@ impl Default for AutoZoomConfig {
             max_ui_rect_area_ratio: 0.45,
             missing_control_max_area_ratio: 0.25,
             missing_control_max_side_ratio: 0.72,
-            scroll_target_step_ratio: 0.10,
-            micro_track_cursor_weight: 0.10,
-            micro_track_sample_ms: 90,
+            focus_sample_ms: 75,
+            focus_base_follow: 0.08,
+            focus_energy_follow: 0.34,
+            focus_energy_rise: 0.40,
+            focus_energy_decay_per_ms: 0.0015,
+            segment_stitch_gap_ms: 900,
             spring_mass: 1.0,
             spring_stiffness: 170.0,
             spring_damping: 26.0,
@@ -485,7 +491,74 @@ pub fn build_auto_zoom_segments_with_context_and_config(
         previous_end = Some(end_ts);
     }
 
-    segments
+    stitch_adjacent_segments(segments, config)
+}
+
+fn stitch_adjacent_segments(
+    mut segments: Vec<ZoomSegment>,
+    config: &AutoZoomConfig,
+) -> Vec<ZoomSegment> {
+    if segments.len() <= 1 {
+        return segments;
+    }
+
+    segments.sort_by_key(|segment| segment.start_ts);
+    let mut stitched: Vec<ZoomSegment> = Vec::with_capacity(segments.len());
+    let mut iter = segments.into_iter();
+    let mut current = iter.next().expect("segments length checked above");
+
+    for mut next in iter {
+        let gap_ms = next.start_ts.saturating_sub(current.end_ts);
+        if gap_ms > config.segment_stitch_gap_ms {
+            stitched.push(current);
+            current = next;
+            continue;
+        }
+
+        if current.target_points.is_empty() {
+            current.target_points.push(TargetPoint {
+                ts: current.start_ts,
+                rect: current.initial_rect.clone(),
+            });
+            current.target_points.push(TargetPoint {
+                ts: current.end_ts,
+                rect: current.initial_rect.clone(),
+            });
+        }
+
+        if next.target_points.is_empty() {
+            next.target_points.push(TargetPoint {
+                ts: next.start_ts,
+                rect: next.initial_rect.clone(),
+            });
+            next.target_points.push(TargetPoint {
+                ts: next.end_ts,
+                rect: next.initial_rect.clone(),
+            });
+        }
+
+        // Keep zoom engaged and retarget smoothly instead of creating rapid in/out segment churn.
+        push_target_point(
+            &mut current.target_points,
+            TargetPoint {
+                ts: next.start_ts,
+                rect: next.initial_rect.clone(),
+            },
+        );
+        for point in next.target_points {
+            push_target_point(&mut current.target_points, point);
+        }
+
+        current.end_ts = current.end_ts.max(next.end_ts);
+    }
+
+    stitched.push(current);
+
+    for (index, segment) in stitched.iter_mut().enumerate() {
+        segment.id = format!("auto-{}", index + 1);
+    }
+
+    stitched
 }
 
 fn collect_click_samples(
@@ -574,9 +647,21 @@ fn collect_scroll_samples(events: &[InputEvent]) -> Vec<ScrollSample> {
 
 fn context_key(ui_context: Option<&UiContext>) -> Option<String> {
     let context = ui_context?;
+    let control = normalize_context(context.control_name.as_deref());
+    let app = normalize_context(context.app_name.as_deref()).and_then(|value| {
+        if value.starts_with("pid:") {
+            None
+        } else {
+            Some(value)
+        }
+    });
 
-    normalize_context(context.app_name.as_deref())
-        .or_else(|| normalize_context(context.control_name.as_deref()))
+    match (app, control) {
+        (Some(app), Some(control)) => Some(format!("app:{app}|control:{control}")),
+        (None, Some(control)) => Some(format!("control:{control}")),
+        (Some(app), None) => Some(format!("app:{app}")),
+        (None, None) => None,
+    }
 }
 
 fn normalized_control_name(ui_context: Option<&UiContext>, max_len: usize) -> Option<String> {
@@ -816,7 +901,7 @@ fn build_target_points(
             continue;
         }
         if let Some(last_ts) = last_pointer_ts {
-            if pointer.ts.saturating_sub(last_ts) < config.micro_track_sample_ms {
+            if pointer.ts.saturating_sub(last_ts) < config.focus_sample_ms {
                 continue;
             }
         }
@@ -834,43 +919,64 @@ fn build_target_points(
             .then(left.order().cmp(&right.order()))
     });
 
-    let cursor_weight = config.micro_track_cursor_weight.clamp(0.0, 0.4);
+    let mut focus_x = base_rect.x + base_rect.width / 2.0;
+    let mut focus_y = base_rect.y + base_rect.height / 2.0;
+    let mut desired_x = focus_x;
+    let mut desired_y = focus_y;
+    let mut energy = 0.0f64;
+    let mut last_ts = start_ts;
+
     for event in events {
+        let ts = event.ts();
+        let dt_ms = ts.saturating_sub(last_ts);
+        energy = decay_energy(energy, dt_ms, config.focus_energy_decay_per_ms);
+
         match event {
-            TargetEvent::Scroll { ts, dx, dy } => {
+            TargetEvent::Scroll { dx, dy, .. } => {
                 let normalized_dx = normalize_scroll_delta(dx);
                 let normalized_dy = normalize_scroll_delta(dy);
-                let shift_x = normalized_dx * base_rect.width * config.scroll_target_step_ratio;
-                let shift_y = -normalized_dy * base_rect.height * config.scroll_target_step_ratio;
-                base_rect = shift_target_rect(&base_rect, shift_x, shift_y);
+                desired_x = (desired_x + normalized_dx * base_rect.width * 0.08).clamp(0.0, 1.0);
+                desired_y = (desired_y - normalized_dy * base_rect.height * 0.12).clamp(0.0, 1.0);
 
-                push_target_point(
-                    &mut target_points,
-                    TargetPoint {
-                        ts,
-                        rect: base_rect.clone(),
-                    },
-                );
+                let scroll_boost = (normalized_dx.abs() + normalized_dy.abs()) * 0.05;
+                energy =
+                    (energy + config.focus_energy_rise * (0.35 + scroll_boost)).clamp(0.0, 1.0);
             }
-            TargetEvent::Pointer { ts, x, y } => {
-                if cursor_weight <= 0.0 {
-                    continue;
-                }
-
+            TargetEvent::Pointer { x, y, .. } => {
                 let cursor_x = (x / metrics.width).clamp(0.0, 1.0);
                 let cursor_y = (y / metrics.height).clamp(0.0, 1.0);
-                let anchor_center_x = base_rect.x + base_rect.width / 2.0;
-                let anchor_center_y = base_rect.y + base_rect.height / 2.0;
-                let target_center_x =
-                    anchor_center_x * (1.0 - cursor_weight) + cursor_x * cursor_weight;
-                let target_center_y =
-                    anchor_center_y * (1.0 - cursor_weight) + cursor_y * cursor_weight;
+                let jump = (cursor_x - desired_x).hypot(cursor_y - desired_y);
+                desired_x = cursor_x;
+                desired_y = cursor_y;
 
-                let tracked = recenter_target_rect(&base_rect, target_center_x, target_center_y);
-                push_target_point(&mut target_points, TargetPoint { ts, rect: tracked });
+                let pointer_boost = (0.5 + jump).clamp(0.1, 1.6);
+                energy = (energy + config.focus_energy_rise * pointer_boost).clamp(0.0, 1.0);
             }
         }
+
+        let follow =
+            (config.focus_base_follow + config.focus_energy_follow * energy).clamp(0.01, 0.98);
+        focus_x += (desired_x - focus_x) * follow;
+        focus_y += (desired_y - focus_y) * follow;
+        base_rect = recenter_target_rect(&base_rect, focus_x, focus_y);
+
+        push_target_point(
+            &mut target_points,
+            TargetPoint {
+                ts,
+                rect: base_rect.clone(),
+            },
+        );
+        last_ts = ts;
     }
+
+    let tail_dt_ms = end_ts.saturating_sub(last_ts);
+    energy = decay_energy(energy, tail_dt_ms, config.focus_energy_decay_per_ms);
+    let settle_follow =
+        (config.focus_base_follow + config.focus_energy_follow * energy).clamp(0.01, 0.98);
+    focus_x += (desired_x - focus_x) * settle_follow;
+    focus_y += (desired_y - focus_y) * settle_follow;
+    base_rect = recenter_target_rect(&base_rect, focus_x, focus_y);
 
     push_target_point(
         &mut target_points,
@@ -883,13 +989,18 @@ fn build_target_points(
     target_points
 }
 
-fn shift_target_rect(base: &NormalizedRect, shift_x: f64, shift_y: f64) -> NormalizedRect {
-    normalize_target_rect(NormalizedRect {
-        x: base.x + shift_x,
-        y: base.y + shift_y,
-        width: base.width,
-        height: base.height,
-    })
+fn decay_energy(current: f64, dt_ms: u64, decay_per_ms: f64) -> f64 {
+    if dt_ms == 0 {
+        return current.clamp(0.0, 1.0);
+    }
+
+    let safe_decay = if decay_per_ms.is_finite() {
+        decay_per_ms.clamp(0.00001, 0.1)
+    } else {
+        0.0015
+    };
+    let decay = (-(safe_decay * dt_ms as f64)).exp();
+    (current * decay).clamp(0.0, 1.0)
 }
 
 fn recenter_target_rect(base: &NormalizedRect, center_x: f64, center_y: f64) -> NormalizedRect {
@@ -981,6 +1092,20 @@ mod tests {
         let segments = build_auto_zoom_segments(&events, 1_920, 1_080, 8_000);
         assert_eq!(segments.len(), 2);
         assert!(segments[0].end_ts <= segments[1].start_ts);
+    }
+
+    #[test]
+    fn stitches_one_second_click_rhythm_into_fewer_segments() {
+        let events = vec![
+            click(1_000, 300.0, 300.0, None, None),
+            click(2_000, 320.0, 320.0, None, None),
+            click(3_000, 340.0, 340.0, None, None),
+        ];
+
+        let segments = build_auto_zoom_segments(&events, 1_920, 1_080, 6_000);
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].end_ts > 3_000);
+        assert!(!segments[0].target_points.is_empty());
     }
 
     #[test]

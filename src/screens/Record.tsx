@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./Record.css";
 
@@ -9,7 +9,32 @@ export default function RecordScreen() {
   const [recordingId, setRecordingId] = useState<string | null>(null);
   const [duration, setDuration] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [startTimer, setStartTimer] = useState<ReturnType<typeof setInterval> | null>(null);
+  const startedAtRef = useRef<number | null>(null);
+  const tickerRef = useRef<number | null>(null);
+
+  const stopTicker = useCallback(() => {
+    if (tickerRef.current !== null) {
+      cancelAnimationFrame(tickerRef.current);
+      tickerRef.current = null;
+    }
+    startedAtRef.current = null;
+  }, []);
+
+  const startTicker = useCallback(() => {
+    startedAtRef.current = performance.now();
+
+    const tick = () => {
+      if (startedAtRef.current === null) {
+        return;
+      }
+
+      const elapsedSec = Math.floor((performance.now() - startedAtRef.current) / 1000);
+      setDuration((current) => (current === elapsedSec ? current : elapsedSec));
+      tickerRef.current = requestAnimationFrame(tick);
+    };
+
+    tickerRef.current = requestAnimationFrame(tick);
+  }, []);
 
   const handleStart = useCallback(async () => {
     setError(null);
@@ -19,25 +44,18 @@ export default function RecordScreen() {
     try {
       const id = await invoke<string>("start_recording", { monitorIndex: 0 });
       setRecordingId(id);
-
-      const timer = setInterval(() => {
-        setDuration((d) => d + 1);
-      }, 1000);
-      setStartTimer(timer);
+      startTicker();
     } catch (err) {
+      stopTicker();
       setState("idle");
       setError(String(err));
     }
-  }, []);
+  }, [startTicker, stopTicker]);
 
   const handleStop = useCallback(async () => {
     if (!recordingId) return;
     setState("stopping");
-
-    if (startTimer) {
-      clearInterval(startTimer);
-      setStartTimer(null);
-    }
+    stopTicker();
 
     try {
       await invoke("stop_recording", { recordingId });
@@ -47,7 +65,11 @@ export default function RecordScreen() {
       setState("idle");
       setError(String(err));
     }
-  }, [recordingId, startTimer]);
+  }, [recordingId, stopTicker]);
+
+  useEffect(() => {
+    return () => stopTicker();
+  }, [stopTicker]);
 
   const formatDuration = (secs: number) => {
     const m = Math.floor(secs / 60).toString().padStart(2, "0");

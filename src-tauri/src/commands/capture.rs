@@ -1,12 +1,10 @@
-//! Tauri IPC-команды для захвата экрана (Этапы 2–3).
+//! Tauri IPC commands for recording.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::algorithm::{auto_zoom, cursor_smoothing};
-use crate::capture::recorder::{
-    get_monitor_scale_factor, get_monitor_size, spawn_ffmpeg, start_capture,
-};
+use crate::capture::recorder::{get_monitor_scale_factor, get_monitor_size, start_capture};
 use crate::capture::state::{ActiveRecording, RecorderState};
 use crate::models::events::{EventsFile, InputEvent, SCHEMA_VERSION as EVENTS_VERSION};
 use crate::models::project::{
@@ -14,10 +12,6 @@ use crate::models::project::{
 };
 use crate::telemetry::logger::{self, TelemetryState};
 
-// ─── IPC команды ──────────────────────────────────────────────────────────────
-
-/// Запускает запись экрана указанного монитора.
-/// Возвращает уникальный ID записи, который потребуется при вызове `stop_recording`.
 #[tauri::command]
 pub async fn start_recording(
     state: tauri::State<'_, RecorderState>,
@@ -30,7 +24,6 @@ pub async fn start_recording(
         return Err("Recording already in progress".to_string());
     }
 
-    // Генерируем ID и создаём директорию проекта.
     let recording_id = uuid::Uuid::new_v4().to_string();
     let output_dir = project_dir(&recording_id)?;
     std::fs::create_dir_all(&output_dir)
@@ -41,7 +34,6 @@ pub async fn start_recording(
         output_dir.display()
     );
 
-    // Определяем физическое разрешение монитора.
     let (width, height) = get_monitor_size(monitor_index)?;
     let scale_factor = get_monitor_scale_factor(monitor_index).unwrap_or_else(|err| {
         log::warn!("start_recording: failed to resolve monitor scale factor: {err}");
@@ -49,26 +41,17 @@ pub async fn start_recording(
     });
     log::info!("start_recording: monitor={monitor_index} resolution={width}x{height}");
 
-    // Запускаем FFmpeg.
     let raw_mp4 = output_dir.join("raw.mp4");
-    let (ffmpeg_process, ffmpeg_stdin) = spawn_ffmpeg(width, height, &raw_mp4)?;
-
-    // Флаг остановки: разделяется между командой и обработчиком кадров.
     let stop_flag = Arc::new(AtomicBool::new(false));
-
-    // Запускаем поток WGC-захвата.
-    let capture_thread = start_capture(monitor_index, stop_flag.clone(), ffmpeg_stdin)?;
+    let capture_thread = start_capture(monitor_index, stop_flag.clone(), raw_mp4, width, height)?;
 
     let start_ms = chrono::Utc::now().timestamp_millis() as u64;
-
-    // Запускаем телеметрию (Этап 3).
     let telemetry_processor = logger::start_session(&telemetry.0, start_ms);
 
     *guard = Some(ActiveRecording {
         recording_id: recording_id.clone(),
         stop_flag,
         capture_thread,
-        ffmpeg_process,
         output_dir,
         width,
         height,
@@ -80,14 +63,12 @@ pub async fn start_recording(
     Ok(recording_id)
 }
 
-/// Останавливает запись, ждёт завершения FFmpeg, сохраняет project.json и events.json.
 #[tauri::command]
 pub async fn stop_recording(
     state: tauri::State<'_, RecorderState>,
     telemetry: tauri::State<'_, TelemetryState>,
     recording_id: String,
 ) -> Result<(), String> {
-    // Забираем сессию из стейта.
     let rec = state.0.lock().await.take().ok_or("No active recording")?;
 
     if rec.recording_id != recording_id {
@@ -100,10 +81,7 @@ pub async fn stop_recording(
 
     log::info!("stop_recording: id={recording_id}");
 
-    // Сигнализируем WGC-обработчику остановиться.
     rec.stop_flag.store(true, Ordering::Relaxed);
-
-    // Сигнализируем телеметрии завершить сессию.
     logger::stop_session(&telemetry.0);
 
     let output_dir = rec.output_dir.clone();
@@ -112,42 +90,22 @@ pub async fn stop_recording(
     let scale_factor = rec.scale_factor;
     let start_ms = rec.start_ms;
 
-    // Финализация в блокирующем потоке (join + FFmpeg wait + telemetry join — блокирующие операции).
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        // Ждём завершения потока WGC-захвата.
-        // Когда поток завершится, ScreenRecorder дропнется → ffmpeg_stdin закрывается.
         match rec.capture_thread.join() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => log::warn!("Capture thread finished with error: {e}"),
             Err(_) => log::error!("Capture thread panicked"),
         }
 
-        // Ждём, пока FFmpeg завершит кодирование.
-        let mut child = rec.ffmpeg_process;
-        match child.wait() {
-            Ok(status) if status.success() => {
-                log::info!("FFmpeg finished OK");
-            }
-            Ok(status) => {
-                return Err(format!("FFmpeg exited with non-zero status: {status}"));
-            }
-            Err(e) => {
-                return Err(format!("Failed to wait for FFmpeg process: {e}"));
-            }
-        }
-
-        // Ждём завершения процессора телеметрии и получаем события.
         let telemetry_events = rec.telemetry_processor.join().unwrap_or_default();
         log::info!(
             "stop_recording: collected {} telemetry events",
             telemetry_events.len()
         );
 
-        // Рассчитываем длительность.
         let end_ms = chrono::Utc::now().timestamp_millis() as u64;
         let duration_ms = end_ms.saturating_sub(start_ms);
 
-        // Сохраняем project.json и events.json.
         save_recording_files(
             &output_dir,
             &recording_id,
@@ -171,9 +129,7 @@ pub async fn stop_recording(
     .map_err(|e| format!("Task join error: {e}"))?
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Путь к директории проекта: `{Videos}/NeuroScreenCaster/{id}/`.
+/// Path to project directory: `{Videos}/NeuroScreenCaster/{id}/`.
 fn project_dir(recording_id: &str) -> Result<std::path::PathBuf, String> {
     let base = dirs::video_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join("Videos")))
@@ -182,7 +138,7 @@ fn project_dir(recording_id: &str) -> Result<std::path::PathBuf, String> {
     Ok(base.join("NeuroScreenCaster").join(recording_id))
 }
 
-/// Сохраняет `project.json` и `events.json` в директорию проекта.
+/// Writes `project.json` and `events.json` into project directory.
 fn save_recording_files(
     output_dir: &std::path::Path,
     recording_id: &str,
@@ -211,7 +167,7 @@ fn save_recording_files(
         zoom_segments.len(),
         smoothed_cursor_path.len()
     );
-    // ── project.json ──────────────────────────────────────────────────────────
+
     let project = Project {
         schema_version: PROJECT_VERSION,
         id: recording_id.to_string(),
@@ -231,7 +187,6 @@ fn save_recording_files(
     std::fs::write(output_dir.join("project.json"), project_json)
         .map_err(|e| format!("Failed to write project.json: {e}"))?;
 
-    // ── events.json ───────────────────────────────────────────────────────────
     let events_file = EventsFile {
         schema_version: EVENTS_VERSION,
         recording_id: recording_id.to_string(),
@@ -250,9 +205,9 @@ fn save_recording_files(
     Ok(())
 }
 
-/// Форматирует человекочитаемое имя записи из Unix timestamp (мс).
 fn format_recording_name(start_ms: u64) -> String {
     use chrono::{TimeZone, Utc};
+
     let dt = Utc
         .timestamp_millis_opt(start_ms as i64)
         .single()

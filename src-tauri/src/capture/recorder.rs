@@ -1,17 +1,12 @@
-//! WGC-захват экрана и интеграция с FFmpeg.
+//! Screen capture pipeline based on Windows Graphics Capture + Media Foundation encoder.
 //!
-//! Захват работает через crate `windows-capture` v1.5+:
-//! - `ScreenRecorder` реализует `GraphicsCaptureApiHandler`.
-//! - Курсор отключён (`CursorCaptureSettings::WithoutCursor`).
-//! - Кадры (BGRA8) пишутся в stdin FFmpeg, который кодирует H.264 MP4.
-//! - Частота ограничена до `TARGET_FPS` пропуском «лишних» кадров.
+//! This module keeps FFmpeg discovery helpers for export, but recording itself no longer streams
+//! raw BGRA frames through a pipe to an external process.
 
-use std::io::Write;
-use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::HMONITOR;
@@ -19,6 +14,10 @@ use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_capture::{
     capture::{Context, GraphicsCaptureApiHandler},
+    encoder::{
+        AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder,
+        VideoSettingsSubType,
+    },
     frame::Frame,
     graphics_capture_api::InternalCaptureControl,
     monitor::Monitor,
@@ -28,32 +27,99 @@ use windows_capture::{
     },
 };
 
-/// Целевая частота кадров выходного видео.
+/// Target FPS for capture/output.
 pub const TARGET_FPS: u32 = 30;
 
-// ─── Обработчик кадров ───────────────────────────────────────────────────────
+const HNS_PER_SECOND: i64 = 10_000_000;
 
-/// Принимает BGRA-кадры от WGC и записывает их в stdin FFmpeg.
+#[derive(Clone, Debug)]
+pub struct CaptureEncoderSettings {
+    pub output_path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub target_fps: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct CaptureFlags {
+    pub stop_flag: Arc<AtomicBool>,
+    pub encoder: CaptureEncoderSettings,
+}
+
 pub struct ScreenRecorder {
     stop_flag: Arc<AtomicBool>,
-    ffmpeg_stdin: ChildStdin,
-    last_frame_time: Instant,
-    frame_interval: Duration,
+    encoder: Option<VideoEncoder>,
+    frame_interval_hns: i64,
+    next_frame_deadline_hns: Option<i64>,
+    encoded_frames: u64,
+    dropped_frames: u64,
+}
+
+impl ScreenRecorder {
+    fn should_encode_frame(&mut self, timestamp_hns: i64) -> bool {
+        if self.next_frame_deadline_hns.is_none() {
+            self.next_frame_deadline_hns =
+                Some(timestamp_hns.saturating_add(self.frame_interval_hns));
+            return true;
+        }
+
+        let deadline = self.next_frame_deadline_hns.unwrap_or(timestamp_hns);
+        if timestamp_hns.saturating_add(self.frame_interval_hns / 2) < deadline {
+            return false;
+        }
+
+        let mut next = deadline.saturating_add(self.frame_interval_hns);
+        while next <= timestamp_hns {
+            next = next.saturating_add(self.frame_interval_hns);
+        }
+        self.next_frame_deadline_hns = Some(next);
+        true
+    }
+
+    fn finish_encoder(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(encoder) = self.encoder.take() {
+            encoder
+                .finish()
+                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+        }
+        Ok(())
+    }
 }
 
 impl GraphicsCaptureApiHandler for ScreenRecorder {
-    /// Flags = (stop_flag, ffmpeg_stdin).
-    type Flags = (Arc<AtomicBool>, ChildStdin);
+    type Flags = CaptureFlags;
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let (stop_flag, stdin) = ctx.flags;
+        let flags = ctx.flags;
+        let target_fps = flags.encoder.target_fps.max(1);
+        let bitrate = estimate_h264_bitrate(flags.encoder.width, flags.encoder.height, target_fps);
+
+        let video_settings = VideoSettingsBuilder::new(flags.encoder.width, flags.encoder.height)
+            .sub_type(VideoSettingsSubType::H264)
+            .frame_rate(target_fps)
+            .bitrate(bitrate);
+
+        let encoder = VideoEncoder::new(
+            video_settings,
+            AudioSettingsBuilder::default().disabled(true),
+            ContainerSettingsBuilder::default(),
+            &flags.encoder.output_path,
+        )
+        .map_err(|err| {
+            format!(
+                "Failed to initialize Media Foundation encoder at {}: {err}",
+                flags.encoder.output_path.display()
+            )
+        })?;
+
         Ok(Self {
-            stop_flag,
-            ffmpeg_stdin: stdin,
-            // Устанавливаем прошлое время, чтобы первый кадр записался сразу.
-            last_frame_time: Instant::now() - Duration::from_secs(1),
-            frame_interval: Duration::from_secs_f64(1.0 / TARGET_FPS as f64),
+            stop_flag: flags.stop_flag,
+            encoder: Some(encoder),
+            frame_interval_hns: (HNS_PER_SECOND / target_fps as i64).max(1),
+            next_frame_deadline_hns: None,
+            encoded_frames: 0,
+            dropped_frames: 0,
         })
     }
 
@@ -62,43 +128,48 @@ impl GraphicsCaptureApiHandler for ScreenRecorder {
         frame: &mut Frame<'_>,
         control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        // Проверяем флаг остановки (выставляется из stop_recording).
         if self.stop_flag.load(Ordering::Relaxed) {
             control.stop();
             return Ok(());
         }
 
-        // Ограничение частоты до TARGET_FPS.
-        let now = Instant::now();
-        if now.duration_since(self.last_frame_time) < self.frame_interval {
+        let timestamp_hns = frame.timestamp().Duration;
+        if !self.should_encode_frame(timestamp_hns) {
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
             return Ok(());
         }
-        self.last_frame_time = now;
 
-        // Получаем BGRA-данные без row-padding.
-        let mut buffer = frame.buffer()?;
-        let raw = buffer.as_nopadding_buffer()?;
-
-        // Пишем кадр в FFmpeg. При ошибке (напр. FFmpeg упал) — останавливаем захват.
-        if let Err(e) = self.ffmpeg_stdin.write_all(raw) {
-            log::error!("FFmpeg stdin write error: {e}");
-            control.stop();
-            return Err(Box::new(e));
+        if let Some(encoder) = self.encoder.as_mut() {
+            if let Err(err) = encoder.send_frame(frame) {
+                control.stop();
+                return Err(Box::new(err));
+            }
+            self.encoded_frames = self.encoded_frames.saturating_add(1);
         }
 
         Ok(())
     }
 
     fn on_closed(&mut self) -> Result<(), Self::Error> {
-        // ffmpeg_stdin дропнется вместе с ScreenRecorder.
-        // FFmpeg получит EOF на stdin и завершит кодирование.
+        self.finish_encoder()?;
+        log::info!(
+            "capture closed: encoded_frames={} dropped_frames={}",
+            self.encoded_frames,
+            self.dropped_frames
+        );
         Ok(())
     }
 }
 
-// ─── Публичные функции ────────────────────────────────────────────────────────
+fn estimate_h264_bitrate(width: u32, height: u32, fps: u32) -> u32 {
+    // Bitrate heuristic tuned for screen content:
+    // 1080p30 ~= 7 Mbps, 1440p60 ~= 20 Mbps, 2160p60 ~= 45 Mbps (clamped).
+    let pixels_per_second = width as f64 * height as f64 * fps.max(1) as f64;
+    let raw = (pixels_per_second * 0.11).round() as u64;
+    raw.clamp(4_000_000, 45_000_000) as u32
+}
 
-/// Возвращает физическое разрешение монитора по индексу (0 = primary).
+/// Returns monitor physical size by monitor index (0 = primary).
 pub fn get_monitor_size(monitor_index: u32) -> Result<(u32, u32), String> {
     let monitors =
         Monitor::enumerate().map_err(|e| format!("Failed to enumerate monitors: {e}"))?;
@@ -158,15 +229,13 @@ pub fn get_monitor_scale_factor(monitor_index: u32) -> Result<f64, String> {
     }
 }
 
-/// Находит ffmpeg-бинарник, не требуя его наличия в системном PATH.
+/// Finds ffmpeg binary without requiring it in system PATH.
 ///
-/// Порядок поиска:
-/// 1. В dev-сборке: `src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe`
-///    (путь вычислен на этапе компиляции через `CARGO_MANIFEST_DIR`).
-/// 2. В production: рядом с исполняемым файлом приложения (Tauri sidecar).
-/// 3. Fallback: системный PATH — если пользователь установил FFmpeg глобально.
+/// Search order:
+/// 1. Dev build: `src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe`
+/// 2. Production: next to bundled app executable (`ffmpeg.exe`)
+/// 3. Fallback: system PATH
 pub fn find_ffmpeg_exe() -> std::path::PathBuf {
-    // ── 1. Dev: compile-time path ──────────────────────────────────────────
     #[cfg(debug_assertions)]
     {
         let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -178,10 +247,8 @@ pub fn find_ffmpeg_exe() -> std::path::PathBuf {
         }
     }
 
-    // ── 2. Production: next to the app exe (Tauri sidecar) ────────────────
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // Tauri strips the target-triple suffix when bundling.
             let candidate = dir.join("ffmpeg.exe");
             if candidate.exists() {
                 log::debug!("ffmpeg: using bundled binary at {}", candidate.display());
@@ -190,72 +257,17 @@ pub fn find_ffmpeg_exe() -> std::path::PathBuf {
         }
     }
 
-    // ── 3. Fallback: system PATH ───────────────────────────────────────────
     log::warn!("ffmpeg: bundled binary not found, falling back to system PATH");
     std::path::PathBuf::from("ffmpeg")
 }
 
-/// Запускает FFmpeg: читает rawvideo (BGRA) из stdin, пишет H.264 MP4 в файл.
-/// Возвращает `(Child, ChildStdin)` — процесс (без stdin) и его stdin.
-pub fn spawn_ffmpeg(
-    width: u32,
-    height: u32,
-    output_path: &Path,
-) -> Result<(Child, ChildStdin), String> {
-    let ffmpeg = find_ffmpeg_exe();
-    let out = output_path
-        .to_str()
-        .ok_or("Output path contains non-UTF-8 characters")?;
-
-    let mut child = Command::new(&ffmpeg)
-        .args([
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgra",
-            "-video_size",
-            &format!("{width}x{height}"),
-            "-r",
-            &TARGET_FPS.to_string(),
-            "-i",
-            "pipe:0",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            out,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "Failed to spawn FFmpeg ({}): {e}. \
-                 Run scripts/download-ffmpeg.ps1 to install the bundled binary.",
-                ffmpeg.display()
-            )
-        })?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or("Failed to acquire FFmpeg stdin pipe")?;
-
-    Ok((child, stdin))
-}
-
-/// Запускает WGC-захват в отдельном потоке.
-/// Поток завершается, когда `stop_flag` становится `true`.
+/// Starts WGC capture on a dedicated thread.
 pub fn start_capture(
     monitor_index: u32,
     stop_flag: Arc<AtomicBool>,
-    ffmpeg_stdin: ChildStdin,
+    output_path: PathBuf,
+    width: u32,
+    height: u32,
 ) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
     let monitors =
         Monitor::enumerate().map_err(|e| format!("Failed to enumerate monitors: {e}"))?;
@@ -265,15 +277,25 @@ pub fn start_capture(
         .nth(monitor_index as usize)
         .ok_or_else(|| format!("Monitor index {monitor_index} not found"))?;
 
+    let flags = CaptureFlags {
+        stop_flag,
+        encoder: CaptureEncoderSettings {
+            output_path,
+            width,
+            height,
+            target_fps: TARGET_FPS,
+        },
+    };
+
     let settings = Settings::new(
         monitor,
         CursorCaptureSettings::WithoutCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Default,
+        MinimumUpdateIntervalSettings::Custom(Duration::from_secs_f64(1.0 / TARGET_FPS as f64)),
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
-        (stop_flag, ffmpeg_stdin),
+        flags,
     );
 
     let handle = std::thread::Builder::new()

@@ -846,7 +846,6 @@ fn build_camera_value_expr(
     default_value: f64,
     source_fps: f64,
 ) -> String {
-    let mut expr = format_f64(default_value);
     let mut ordered = states.to_vec();
     ordered.sort_by(|left, right| {
         left.start_frame
@@ -854,6 +853,9 @@ fn build_camera_value_expr(
             .then_with(|| left.end_frame.total_cmp(&right.end_frame))
     });
     let safe_fps = source_fps.max(1.0);
+    let default_expr = format_f64(default_value);
+    let mut terms = Vec::with_capacity(ordered.len() + 1);
+    terms.push(default_expr.clone());
 
     for state in ordered {
         let axis_state = axis(&state);
@@ -864,16 +866,18 @@ fn build_camera_value_expr(
         );
         let value = spring_value_expr(&elapsed, axis_state, state.spring);
 
-        expr = format!(
-            "if(between(n,{start},{end}),{value},{rest})",
+        // Build a flat sum of disjoint interval terms instead of deeply nested if-expressions.
+        // Nested expressions can exceed FFmpeg parser depth on projects with many segments.
+        terms.push(format!(
+            "if(gte(n,{start})*lt(n,{end}),({value})-({default}),0)",
             start = format_f64(state.start_frame),
             end = format_f64(state.end_frame),
             value = value,
-            rest = expr
-        );
+            default = default_expr
+        ));
     }
 
-    expr
+    terms.join("+")
 }
 
 fn spring_value_expr(

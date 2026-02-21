@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use crate::models::events::InputEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -50,44 +48,84 @@ pub fn smooth_cursor_points(points: &[CursorPoint], smoothing_factor: f64) -> Ve
         return points.to_vec();
     }
 
-    let epsilon = 0.25 + factor * 10.0;
-    let simplified = simplify_with_click_anchors(points, epsilon);
+    let filtered = adaptive_holt_filter(points, factor);
     let samples_per_segment = ((2.0 + factor * 6.0).round() as usize).max(2);
-    let interpolated = catmull_rom_interpolate(&simplified, samples_per_segment);
-    snap_click_points(interpolated, &simplified)
+    let interpolated = bezier_interpolate(&filtered, samples_per_segment);
+    snap_click_points(interpolated, points)
 }
 
-pub fn simplify_with_click_anchors(points: &[CursorPoint], epsilon: f64) -> Vec<CursorPoint> {
-    if points.len() <= 2 {
-        return points.to_vec();
-    }
-
-    let mut anchors = BTreeSet::new();
-    anchors.insert(0);
-    anchors.insert(points.len() - 1);
-    for (idx, point) in points.iter().enumerate() {
-        if point.is_click {
-            anchors.insert(idx);
-        }
-    }
-
-    let anchor_indices = anchors.into_iter().collect::<Vec<_>>();
-    let mut keep = BTreeSet::new();
-    for idx in &anchor_indices {
-        keep.insert(*idx);
-    }
-
-    for window in anchor_indices.windows(2) {
-        rdp_between(points, window[0], window[1], epsilon, &mut keep);
-    }
-
-    keep.into_iter().map(|idx| points[idx]).collect()
+/// Kept for compatibility with previous API.
+/// RDP-based simplification is intentionally disabled to preserve hand micro-dynamics.
+pub fn simplify_with_click_anchors(points: &[CursorPoint], _epsilon: f64) -> Vec<CursorPoint> {
+    dedupe_points(points.to_vec())
 }
 
+/// Kept for compatibility with previous API.
+/// Internally switched from Catmull-Rom sampling to cubic Bezier interpolation.
 pub fn catmull_rom_interpolate(
     points: &[CursorPoint],
     samples_per_segment: usize,
 ) -> Vec<CursorPoint> {
+    bezier_interpolate(points, samples_per_segment)
+}
+
+fn adaptive_holt_filter(points: &[CursorPoint], smoothing_factor: f64) -> Vec<CursorPoint> {
+    let alpha_base = (0.72 - smoothing_factor * 0.58).clamp(0.08, 0.95);
+    let beta_base = (0.34 - smoothing_factor * 0.25).clamp(0.03, 0.9);
+
+    let mut output = Vec::with_capacity(points.len());
+    let first = points[0];
+    output.push(first);
+
+    let mut level_x = first.x;
+    let mut level_y = first.y;
+    let mut trend_x = 0.0;
+    let mut trend_y = 0.0;
+
+    for idx in 1..points.len() {
+        let point = points[idx];
+        let prev_input = points[idx - 1];
+
+        if point.is_click {
+            level_x = point.x;
+            level_y = point.y;
+            trend_x = 0.0;
+            trend_y = 0.0;
+            output.push(point);
+            continue;
+        }
+
+        let dt_ms = point.ts.saturating_sub(prev_input.ts).max(1) as f64;
+        let dt_scale = (dt_ms / 16.0).clamp(0.25, 4.0);
+        let speed = (point.x - prev_input.x).hypot(point.y - prev_input.y) / dt_ms;
+        let speed_boost = (speed / 3.0).clamp(0.0, 1.0);
+
+        // Faster hand movement should reduce lag; slower movement should smooth more.
+        let alpha = (alpha_base + (1.0 - alpha_base) * speed_boost * 0.68).clamp(0.05, 0.98);
+        let beta = (beta_base + (1.0 - beta_base) * speed_boost * 0.42).clamp(0.02, 0.95);
+
+        let prev_level_x = level_x;
+        let prev_level_y = level_y;
+
+        let prediction_x = level_x + trend_x * dt_scale;
+        let prediction_y = level_y + trend_y * dt_scale;
+        level_x = alpha * point.x + (1.0 - alpha) * prediction_x;
+        level_y = alpha * point.y + (1.0 - alpha) * prediction_y;
+        trend_x = beta * (level_x - prev_level_x) + (1.0 - beta) * trend_x;
+        trend_y = beta * (level_y - prev_level_y) + (1.0 - beta) * trend_y;
+
+        output.push(CursorPoint {
+            ts: point.ts,
+            x: level_x,
+            y: level_y,
+            is_click: false,
+        });
+    }
+
+    output
+}
+
+fn bezier_interpolate(points: &[CursorPoint], samples_per_segment: usize) -> Vec<CursorPoint> {
     if points.len() < 2 {
         return points.to_vec();
     }
@@ -109,14 +147,27 @@ pub fn catmull_rom_interpolate(
             points[idx + 1]
         };
 
+        let c1x = p1.x + (p2.x - p0.x) / 6.0;
+        let c1y = p1.y + (p2.y - p0.y) / 6.0;
+        let c2x = p2.x - (p3.x - p1.x) / 6.0;
+        let c2y = p2.y - (p3.y - p1.y) / 6.0;
+
         for step in 0..=samples {
             if idx > 0 && step == 0 {
                 continue;
             }
 
             let t = step as f64 / samples as f64;
-            let x = catmull_value(p0.x, p1.x, p2.x, p3.x, t);
-            let y = catmull_value(p0.y, p1.y, p2.y, p3.y, t);
+            let omt = 1.0 - t;
+            let x = omt.powi(3) * p1.x
+                + 3.0 * omt.powi(2) * t * c1x
+                + 3.0 * omt * t.powi(2) * c2x
+                + t.powi(3) * p2.x;
+            let y = omt.powi(3) * p1.y
+                + 3.0 * omt.powi(2) * t * c1y
+                + 3.0 * omt * t.powi(2) * c2y
+                + t.powi(3) * p2.y;
+
             let ts = lerp_ts(p1.ts, p2.ts, t);
             let is_click = (step == 0 && p1.is_click) || (step == samples && p2.is_click);
 
@@ -125,68 +176,6 @@ pub fn catmull_rom_interpolate(
     }
 
     result
-}
-
-fn rdp_between(
-    points: &[CursorPoint],
-    start: usize,
-    end: usize,
-    epsilon: f64,
-    keep: &mut BTreeSet<usize>,
-) {
-    if end <= start + 1 {
-        keep.insert(start);
-        keep.insert(end);
-        return;
-    }
-
-    let mut farthest_idx = start;
-    let mut max_distance = 0.0;
-    for idx in (start + 1)..end {
-        let distance = perpendicular_distance(points[idx], points[start], points[end]);
-        if distance > max_distance {
-            max_distance = distance;
-            farthest_idx = idx;
-        }
-    }
-
-    if max_distance > epsilon {
-        rdp_between(points, start, farthest_idx, epsilon, keep);
-        rdp_between(points, farthest_idx, end, epsilon, keep);
-        return;
-    }
-
-    keep.insert(start);
-    keep.insert(end);
-}
-
-fn perpendicular_distance(
-    point: CursorPoint,
-    line_start: CursorPoint,
-    line_end: CursorPoint,
-) -> f64 {
-    let dx = line_end.x - line_start.x;
-    let dy = line_end.y - line_start.y;
-    if dx.abs() < f64::EPSILON && dy.abs() < f64::EPSILON {
-        return (point.x - line_start.x).hypot(point.y - line_start.y);
-    }
-
-    let length_sq = dx * dx + dy * dy;
-    let t = (((point.x - line_start.x) * dx + (point.y - line_start.y) * dy) / length_sq)
-        .clamp(0.0, 1.0);
-    let projection_x = line_start.x + t * dx;
-    let projection_y = line_start.y + t * dy;
-    (point.x - projection_x).hypot(point.y - projection_y)
-}
-
-fn catmull_value(p0: f64, p1: f64, p2: f64, p3: f64, t: f64) -> f64 {
-    let t2 = t * t;
-    let t3 = t2 * t;
-
-    0.5 * ((2.0 * p1)
-        + (-p0 + p2) * t
-        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
 }
 
 fn lerp_ts(start: u64, end: u64, t: f64) -> u64 {
@@ -276,12 +265,6 @@ mod tests {
                 y: 0.3,
                 is_click: false,
             },
-            CursorPoint {
-                ts: 40,
-                x: 20.0,
-                y: 0.0,
-                is_click: false,
-            },
         ];
 
         let simplified = simplify_with_click_anchors(&points, 5.0);
@@ -291,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn catmull_rom_keeps_control_points_at_segment_edges() {
+    fn interpolation_keeps_control_points_at_segment_edges() {
         let points = vec![
             CursorPoint {
                 ts: 0,
