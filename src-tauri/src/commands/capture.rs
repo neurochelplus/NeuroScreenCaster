@@ -194,7 +194,15 @@ fn save_recording_files(
     events: Vec<InputEvent>,
 ) -> Result<(), String> {
     let settings = ProjectSettings::default();
-    let zoom_segments = auto_zoom::build_auto_zoom_segments(&events, width, height, duration_ms);
+    let output_aspect_ratio = settings.export.width as f64 / settings.export.height.max(1) as f64;
+    let zoom_segments = auto_zoom::build_auto_zoom_segments_with_context(
+        &events,
+        width,
+        height,
+        scale_factor,
+        duration_ms,
+        output_aspect_ratio,
+    );
     let smoothed_cursor_path =
         cursor_smoothing::smooth_cursor_path(&events, settings.cursor.smoothing_factor);
 

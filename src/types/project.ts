@@ -19,6 +19,12 @@ export type ZoomEasing = "linear" | "ease-in" | "ease-out" | "ease-in-out";
 
 // --- Таймлайн ---
 
+export interface PanKeyframe {
+  ts: number;
+  offsetX: number;
+  offsetY: number;
+}
+
 export interface ZoomSegment {
   id: string;
   /** Начало сегмента (мс от начала записи). */
@@ -26,7 +32,9 @@ export interface ZoomSegment {
   /** Конец сегмента (мс). */
   endTs: number;
   /** Целевая область просмотра (нормализованные координаты). */
-  targetRect: NormalizedRect;
+  initialRect?: NormalizedRect;
+  targetRect?: NormalizedRect;
+  panTrajectory?: PanKeyframe[];
   easing: ZoomEasing;
   /** true — создан алгоритмом авто-зума; false — пользователем вручную. */
   isAuto: boolean;

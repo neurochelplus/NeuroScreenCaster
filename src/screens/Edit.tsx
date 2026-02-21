@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { dirname, isAbsolute, join } from "@tauri-apps/api/path";
 import type { EventsFile } from "../types/events";
-import type { NormalizedRect, Project, ZoomSegment } from "../types/project";
+import type { NormalizedRect, PanKeyframe, Project, ZoomSegment } from "../types/project";
 import "./Edit.css";
 
 interface ProjectListItem {
@@ -58,6 +58,67 @@ function normalizeRect(rect: NormalizedRect): NormalizedRect {
   const x = clamp(rect.x, 0, 1 - width);
   const y = clamp(rect.y, 0, 1 - height);
   return { x, y, width, height };
+}
+
+function getSegmentBaseRect(segment: ZoomSegment): NormalizedRect {
+  return normalizeRect(segment.initialRect ?? segment.targetRect ?? DEFAULT_RECT);
+}
+
+function getSortedPanTrajectory(segment: ZoomSegment): PanKeyframe[] {
+  return [...(segment.panTrajectory ?? [])].sort((a, b) => a.ts - b.ts);
+}
+
+function panOffsetAtTime(trajectory: PanKeyframe[], ts: number): { offsetX: number; offsetY: number } {
+  if (trajectory.length === 0 || ts <= trajectory[0].ts) {
+    return { offsetX: 0, offsetY: 0 };
+  }
+
+  const last = trajectory[trajectory.length - 1];
+  if (ts >= last.ts) {
+    return { offsetX: last.offsetX, offsetY: last.offsetY };
+  }
+
+  for (let index = 0; index < trajectory.length - 1; index += 1) {
+    const left = trajectory[index];
+    const right = trajectory[index + 1];
+    if (ts < left.ts || ts > right.ts) {
+      continue;
+    }
+
+    const span = right.ts - left.ts;
+    if (span <= 0) {
+      return { offsetX: right.offsetX, offsetY: right.offsetY };
+    }
+
+    const t = (ts - left.ts) / span;
+    return {
+      offsetX: left.offsetX + (right.offsetX - left.offsetX) * t,
+      offsetY: left.offsetY + (right.offsetY - left.offsetY) * t,
+    };
+  }
+
+  return { offsetX: last.offsetX, offsetY: last.offsetY };
+}
+
+function getSegmentRectAtTimelineTs(segment: ZoomSegment, timelineTs: number): NormalizedRect {
+  const base = getSegmentBaseRect(segment);
+  const { offsetX, offsetY } = panOffsetAtTime(getSortedPanTrajectory(segment), timelineTs);
+
+  return normalizeRect({
+    x: base.x + offsetX,
+    y: base.y + offsetY,
+    width: base.width,
+    height: base.height,
+  });
+}
+
+function updateSegmentBaseRect(segment: ZoomSegment, rect: NormalizedRect): ZoomSegment {
+  const { targetRect: _legacyTargetRect, ...rest } = segment;
+  return {
+    ...rest,
+    initialRect: normalizeRect(rect),
+    panTrajectory: [],
+  };
 }
 
 function sortSegments(segments: ZoomSegment[]): ZoomSegment[] {
@@ -330,20 +391,22 @@ export default function EditScreen() {
     if (!selectedSegment) {
       return { x: 0.5, y: 0.5 };
     }
+    const rect = getSegmentBaseRect(selectedSegment);
     return {
-      x: selectedSegment.targetRect.x + selectedSegment.targetRect.width / 2,
-      y: selectedSegment.targetRect.y + selectedSegment.targetRect.height / 2,
+      x: rect.x + rect.width / 2,
+      y: rect.y + rect.height / 2,
     };
   }, [selectedSegment]);
 
   const selectedSegmentZoom = useMemo(
-    () => (selectedSegment ? getZoomStrength(selectedSegment.targetRect) : 1),
+    () => (selectedSegment ? getZoomStrength(getSegmentBaseRect(selectedSegment)) : 1),
     [selectedSegment]
   );
 
   const selectedSegmentAspect = useMemo(() => {
     if (selectedSegment) {
-      return selectedSegment.targetRect.width / Math.max(selectedSegment.targetRect.height, MIN_RECT_SIZE);
+      const rect = getSegmentBaseRect(selectedSegment);
+      return rect.width / Math.max(rect.height, MIN_RECT_SIZE);
     }
     if (project) {
       return project.videoWidth / Math.max(project.videoHeight, 1);
@@ -351,7 +414,9 @@ export default function EditScreen() {
     return 16 / 9;
   }, [selectedSegment, project]);
 
-  const previewRect = activeSegment?.targetRect ?? FULL_RECT;
+  const previewRect = activeSegment
+    ? getSegmentRectAtTimelineTs(activeSegment, playheadTimelineMs)
+    : FULL_RECT;
   const previewScale = 1 / Math.max(previewRect.width, previewRect.height);
   const centerX = previewRect.x + previewRect.width / 2;
   const centerY = previewRect.y + previewRect.height / 2;
@@ -738,13 +803,16 @@ export default function EditScreen() {
     const startTs = clamp(playheadTimelineMs, 0, Math.max(0, timelineDurationMs - MIN_SEGMENT_MS));
     const endTs = clamp(startTs + 1600, startTs + MIN_SEGMENT_MS, timelineDurationMs);
     const nextId = `manual-${Date.now()}`;
-    const rect = activeSegment ? activeSegment.targetRect : DEFAULT_RECT;
+    const rect = activeSegment
+      ? getSegmentRectAtTimelineTs(activeSegment, playheadTimelineMs)
+      : DEFAULT_RECT;
 
     const newSegment: ZoomSegment = {
       id: nextId,
       startTs,
       endTs,
-      targetRect: normalizeRect(rect),
+      initialRect: normalizeRect(rect),
+      panTrajectory: [],
       easing: "ease-in-out",
       isAuto: false,
     };
@@ -781,8 +849,10 @@ export default function EditScreen() {
     }
 
     updateSegment(selectedSegment.id, (segment) => ({
-      ...segment,
-      targetRect: buildRectFromCenterZoom(centerX, centerY, zoomStrength, selectedSegmentAspect),
+      ...updateSegmentBaseRect(
+        segment,
+        buildRectFromCenterZoom(centerX, centerY, zoomStrength, selectedSegmentAspect)
+      ),
       isAuto: false,
     }));
   };
@@ -1184,7 +1254,7 @@ export default function EditScreen() {
                           return null;
                         }
                         const isSelected = selectedSegmentId === visual.id;
-                        const zoom = getZoomStrength(segment.targetRect);
+                        const zoom = getZoomStrength(getSegmentBaseRect(segment));
 
                         return (
                           <div

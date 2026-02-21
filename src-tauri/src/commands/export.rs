@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::algorithm::cursor_smoothing::smooth_cursor_path;
 use crate::capture::recorder::find_ffmpeg_exe;
 use crate::models::events::{EventsFile, SCHEMA_VERSION as EVENTS_SCHEMA_VERSION};
-use crate::models::project::{Project, ZoomEasing, SCHEMA_VERSION};
+use crate::models::project::{NormalizedRect, PanKeyframe, Project, ZoomEasing, SCHEMA_VERSION};
 
 const CAMERA_TRANSITION_MS: f64 = 180.0;
 
@@ -48,9 +48,12 @@ pub struct ExportState(pub Arc<Mutex<ExportStatus>>);
 struct CameraState {
     start_frame: f64,
     end_frame: f64,
-    zoom: f64,
-    offset_x: f64,
-    offset_y: f64,
+    from_zoom: f64,
+    to_zoom: f64,
+    from_offset_x: f64,
+    to_offset_x: f64,
+    from_offset_y: f64,
+    to_offset_y: f64,
     easing: ZoomEasing,
 }
 
@@ -410,21 +413,24 @@ fn build_export_filter_graph(
         source_height.max(1),
         render_fps,
     );
-    let transition_frames = (render_fps * (CAMERA_TRANSITION_MS / 1000.0)).clamp(1.0, 120.0);
 
-    let zoom_expr =
-        build_camera_value_expr(&camera_states, |state| state.zoom, 1.0, transition_frames);
+    let zoom_expr = build_camera_value_expr(
+        &camera_states,
+        |state| state.from_zoom,
+        |state| state.to_zoom,
+        1.0,
+    );
     let offset_x_expr = build_camera_value_expr(
         &camera_states,
-        |state| state.offset_x,
+        |state| state.from_offset_x,
+        |state| state.to_offset_x,
         0.0,
-        transition_frames,
     );
     let offset_y_expr = build_camera_value_expr(
         &camera_states,
-        |state| state.offset_y,
+        |state| state.from_offset_y,
+        |state| state.to_offset_y,
         0.0,
-        transition_frames,
     );
 
     let mut input_chain: Vec<String> = Vec::new();
@@ -481,120 +487,263 @@ fn build_camera_states(
 
     let sw = source_width as f64;
     let sh = source_height as f64;
+    let transition_project_ms = CAMERA_TRANSITION_MS.round().max(1.0) as u64;
     let mut states = Vec::new();
+    let default_camera = (1.0, 0.0, 0.0);
 
     for segment in segments {
-        let start_ms = map_time_ms(segment.start_ts, project_duration_ms, source_duration_ms);
-        let end_ms = map_time_ms(segment.end_ts, project_duration_ms, source_duration_ms);
-        if end_ms <= start_ms {
+        let start_ts = segment.start_ts.min(project_duration_ms);
+        let end_ts = segment.end_ts.min(project_duration_ms);
+        if end_ts <= start_ts {
             continue;
         }
 
-        let zoom =
-            (1.0 / segment.target_rect.width.max(segment.target_rect.height)).clamp(1.0, 20.0);
-        let crop_w = (sw / zoom).clamp(32.0, sw);
-        let crop_h = (sh / zoom).clamp(32.0, sh);
+        let entry_end_ts = (start_ts.saturating_add(transition_project_ms)).min(end_ts);
+        let exit_start_ts = if end_ts > entry_end_ts {
+            end_ts
+                .saturating_sub(transition_project_ms)
+                .max(entry_end_ts)
+        } else {
+            entry_end_ts
+        };
 
-        let center_x = (segment.target_rect.x + segment.target_rect.width / 2.0) * sw;
-        let center_y = (segment.target_rect.y + segment.target_rect.height / 2.0) * sh;
-        let crop_x = (center_x - crop_w / 2.0).clamp(0.0, (sw - crop_w).max(0.0));
-        let crop_y = (center_y - crop_h / 2.0).clamp(0.0, (sh - crop_h).max(0.0));
+        let mut pan_trajectory = segment.pan_trajectory.clone();
+        pan_trajectory.sort_by_key(|keyframe| keyframe.ts);
+        let base_rect = normalize_segment_rect(segment.initial_rect.clone());
+        let rect_at_ts = |ts: u64| {
+            let (offset_x, offset_y) = pan_offset_at_ts(&pan_trajectory, ts);
+            apply_pan_offset(&base_rect, offset_x, offset_y)
+        };
 
-        let max_offset_x = (sw * zoom - sw).max(0.0);
-        let max_offset_y = (sh * zoom - sh).max(0.0);
-        let offset_x = (crop_x * zoom).clamp(0.0, max_offset_x);
-        let offset_y = (crop_y * zoom).clamp(0.0, max_offset_y);
+        let initial_camera = rect_to_camera_values(rect_at_ts(start_ts), sw, sh);
+        push_camera_state(
+            &mut states,
+            start_ts,
+            entry_end_ts,
+            project_duration_ms,
+            source_duration_ms,
+            source_fps,
+            default_camera,
+            initial_camera,
+            segment.easing.clone(),
+        );
 
-        states.push(CameraState {
-            start_frame: start_ms as f64 / 1000.0 * source_fps,
-            end_frame: end_ms as f64 / 1000.0 * source_fps,
-            zoom,
-            offset_x,
-            offset_y,
-            easing: segment.easing,
-        });
+        if exit_start_ts > entry_end_ts {
+            let mut anchors = vec![entry_end_ts];
+            anchors.extend(
+                pan_trajectory
+                    .iter()
+                    .filter(|keyframe| keyframe.ts > entry_end_ts && keyframe.ts < exit_start_ts)
+                    .map(|keyframe| keyframe.ts),
+            );
+            anchors.push(exit_start_ts);
+            anchors.sort_unstable();
+            anchors.dedup();
+
+            for pair in anchors.windows(2) {
+                let from_ts = pair[0];
+                let to_ts = pair[1];
+                if to_ts <= from_ts {
+                    continue;
+                }
+
+                let from_camera = rect_to_camera_values(rect_at_ts(from_ts), sw, sh);
+                let to_camera = rect_to_camera_values(rect_at_ts(to_ts), sw, sh);
+                push_camera_state(
+                    &mut states,
+                    from_ts,
+                    to_ts,
+                    project_duration_ms,
+                    source_duration_ms,
+                    source_fps,
+                    from_camera,
+                    to_camera,
+                    segment.easing.clone(),
+                );
+            }
+        }
+
+        if end_ts > exit_start_ts {
+            let exit_camera = rect_to_camera_values(rect_at_ts(exit_start_ts), sw, sh);
+            push_camera_state(
+                &mut states,
+                exit_start_ts,
+                end_ts,
+                project_duration_ms,
+                source_duration_ms,
+                source_fps,
+                exit_camera,
+                default_camera,
+                segment.easing,
+            );
+        }
     }
+
+    states.sort_by(|left, right| {
+        left.start_frame
+            .total_cmp(&right.start_frame)
+            .then_with(|| left.end_frame.total_cmp(&right.end_frame))
+    });
 
     states
 }
 
 fn build_camera_value_expr(
     states: &[CameraState],
-    value: impl Fn(&CameraState) -> f64,
+    from_value: impl Fn(&CameraState) -> f64,
+    to_value: impl Fn(&CameraState) -> f64,
     default_value: f64,
-    transition_frames: f64,
 ) -> String {
     let mut expr = format_f64(default_value);
-    let trans = transition_frames.max(1.0);
+    let mut ordered = states.to_vec();
+    ordered.sort_by(|left, right| {
+        left.start_frame
+            .total_cmp(&right.start_frame)
+            .then_with(|| left.end_frame.total_cmp(&right.end_frame))
+    });
 
-    for (index, state) in states.iter().enumerate().rev() {
-        let target_value = value(state);
-        let prev_value = if index > 0 && state.start_frame - states[index - 1].end_frame <= 1.0 {
-            value(&states[index - 1])
-        } else {
-            default_value
-        };
-        let next_value =
-            if index + 1 < states.len() && states[index + 1].start_frame - state.end_frame <= 1.0 {
-                value(&states[index + 1])
-            } else {
-                default_value
-            };
-
-        let available = (state.end_frame - state.start_frame).max(1.0);
-        let edge_frames = trans.min(available / 2.0).max(1.0);
-        let in_end = state.start_frame + edge_frames;
-        let out_start = state.end_frame - edge_frames;
-
-        let in_t = format!(
+    for state in ordered {
+        let duration = (state.end_frame - state.start_frame).max(1.0);
+        let progress = format!(
             "max(0,min(1,(n-{start})/{duration}))",
             start = format_f64(state.start_frame),
-            duration = format_f64(edge_frames)
+            duration = format_f64(duration)
         );
-        let out_t = format!(
-            "max(0,min(1,(n-{start})/{duration}))",
-            start = format_f64(out_start),
-            duration = format_f64(edge_frames)
-        );
-        let eased_in = easing_progress_expr(&in_t, &state.easing);
-        let eased_out = easing_progress_expr(&out_t, &state.easing);
-
-        let blend_in = format!(
+        let eased_progress = easing_progress_expr(&progress, &state.easing);
+        let interpolated = format!(
             "{from}+({to}-{from})*({progress})",
-            from = format_f64(prev_value),
-            to = format_f64(target_value),
-            progress = eased_in
+            from = format_f64(from_value(&state)),
+            to = format_f64(to_value(&state)),
+            progress = eased_progress
         );
-        let blend_out = format!(
-            "{from}+({to}-{from})*({progress})",
-            from = format_f64(target_value),
-            to = format_f64(next_value),
-            progress = eased_out
-        );
-
-        let inner = if out_start > in_end {
-            format!(
-                "if(lt(n,{in_end}),{blend_in},if(lt(n,{out_start}),{target},{blend_out}))",
-                in_end = format_f64(in_end),
-                blend_in = blend_in,
-                out_start = format_f64(out_start),
-                target = format_f64(target_value),
-                blend_out = blend_out
-            )
-        } else {
-            // Very short segment: perform a single eased blend into target.
-            blend_in
-        };
 
         expr = format!(
-            "if(between(n,{start},{end}),{inner},{rest})",
+            "if(between(n,{start},{end}),{value},{rest})",
             start = format_f64(state.start_frame),
             end = format_f64(state.end_frame),
-            inner = inner,
+            value = interpolated,
             rest = expr
         );
     }
+
     expr
+}
+
+fn push_camera_state(
+    states: &mut Vec<CameraState>,
+    start_ts: u64,
+    end_ts: u64,
+    project_duration_ms: u64,
+    source_duration_ms: u64,
+    source_fps: f64,
+    from: (f64, f64, f64),
+    to: (f64, f64, f64),
+    easing: ZoomEasing,
+) {
+    if end_ts <= start_ts {
+        return;
+    }
+
+    let start_ms = map_time_ms(start_ts, project_duration_ms, source_duration_ms);
+    let end_ms = map_time_ms(end_ts, project_duration_ms, source_duration_ms);
+    if end_ms <= start_ms {
+        return;
+    }
+
+    states.push(CameraState {
+        start_frame: start_ms as f64 / 1000.0 * source_fps,
+        end_frame: end_ms as f64 / 1000.0 * source_fps,
+        from_zoom: from.0,
+        to_zoom: to.0,
+        from_offset_x: from.1,
+        to_offset_x: to.1,
+        from_offset_y: from.2,
+        to_offset_y: to.2,
+        easing,
+    });
+}
+
+fn rect_to_camera_values(
+    rect: NormalizedRect,
+    source_width: f64,
+    source_height: f64,
+) -> (f64, f64, f64) {
+    let zoom = (1.0 / rect.width.max(rect.height).max(0.0001)).clamp(1.0, 20.0);
+    let crop_w = (source_width / zoom).clamp(32.0, source_width);
+    let crop_h = (source_height / zoom).clamp(32.0, source_height);
+
+    let center_x = (rect.x + rect.width / 2.0) * source_width;
+    let center_y = (rect.y + rect.height / 2.0) * source_height;
+    let crop_x = (center_x - crop_w / 2.0).clamp(0.0, (source_width - crop_w).max(0.0));
+    let crop_y = (center_y - crop_h / 2.0).clamp(0.0, (source_height - crop_h).max(0.0));
+
+    let max_offset_x = (source_width * zoom - source_width).max(0.0);
+    let max_offset_y = (source_height * zoom - source_height).max(0.0);
+    let offset_x = (crop_x * zoom).clamp(0.0, max_offset_x);
+    let offset_y = (crop_y * zoom).clamp(0.0, max_offset_y);
+
+    (zoom, offset_x, offset_y)
+}
+
+fn normalize_segment_rect(rect: NormalizedRect) -> NormalizedRect {
+    let width = rect.width.clamp(0.001, 1.0);
+    let height = rect.height.clamp(0.001, 1.0);
+
+    NormalizedRect {
+        x: rect.x.clamp(0.0, 1.0 - width),
+        y: rect.y.clamp(0.0, 1.0 - height),
+        width,
+        height,
+    }
+}
+
+fn apply_pan_offset(base_rect: &NormalizedRect, offset_x: f64, offset_y: f64) -> NormalizedRect {
+    let normalized = normalize_segment_rect(base_rect.clone());
+    let x = (normalized.x + offset_x).clamp(0.0, 1.0 - normalized.width);
+    let y = (normalized.y + offset_y).clamp(0.0, 1.0 - normalized.height);
+
+    NormalizedRect {
+        x,
+        y,
+        width: normalized.width,
+        height: normalized.height,
+    }
+}
+
+fn pan_offset_at_ts(pan_trajectory: &[PanKeyframe], ts: u64) -> (f64, f64) {
+    if pan_trajectory.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    if ts <= pan_trajectory[0].ts {
+        return (0.0, 0.0);
+    }
+
+    let last = pan_trajectory
+        .last()
+        .expect("pan trajectory has at least one keyframe");
+    if ts >= last.ts {
+        return (last.offset_x, last.offset_y);
+    }
+
+    for pair in pan_trajectory.windows(2) {
+        let left = &pair[0];
+        let right = &pair[1];
+        if ts < left.ts || ts > right.ts {
+            continue;
+        }
+        let span = right.ts.saturating_sub(left.ts);
+        if span == 0 {
+            return (right.offset_x, right.offset_y);
+        }
+        let t = (ts.saturating_sub(left.ts)) as f64 / span as f64;
+        return (
+            left.offset_x + (right.offset_x - left.offset_x) * t,
+            left.offset_y + (right.offset_y - left.offset_y) * t,
+        );
+    }
+
+    (last.offset_x, last.offset_y)
 }
 
 fn easing_progress_expr(t_expr: &str, easing: &ZoomEasing) -> String {
@@ -1050,12 +1199,13 @@ mod tests {
                     id: "z1".to_string(),
                     start_ts: 1_000,
                     end_ts: 2_000,
-                    target_rect: NormalizedRect {
+                    initial_rect: NormalizedRect {
                         x: 0.4,
                         y: 0.3,
                         width: 0.2,
                         height: 0.2,
                     },
+                    pan_trajectory: vec![],
                     easing: ZoomEasing::EaseInOut,
                     is_auto: true,
                 }],

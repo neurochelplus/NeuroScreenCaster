@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Gdi::HMONITOR;
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_capture::{
     capture::{Context, GraphicsCaptureApiHandler},
     frame::Frame,
@@ -23,10 +27,6 @@ use windows_capture::{
         MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     },
 };
-#[cfg(target_os = "windows")]
-use windows::Win32::Graphics::Gdi::HMONITOR;
-#[cfg(target_os = "windows")]
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
 /// Целевая частота кадров выходного видео.
 pub const TARGET_FPS: u32 = 30;

@@ -20,6 +20,10 @@ fn query_uia(x: f64, y: f64) -> Option<UiContext> {
     let point = Point::new(x as i32, y as i32);
     let element = auto.element_from_point(point).ok()?;
 
+    let app_name = element
+        .get_process_id()
+        .ok()
+        .map(|pid| format!("pid:{pid}"));
     let control_name = element.get_name().ok().filter(|s| !s.is_empty());
 
     let bounding_rect = element.get_bounding_rectangle().ok().map(|r| BoundingRect {
@@ -30,7 +34,7 @@ fn query_uia(x: f64, y: f64) -> Option<UiContext> {
     });
 
     Some(UiContext {
-        app_name: None, // TODO Этап 7: определить через process ID элемента
+        app_name,
         control_name,
         bounding_rect,
     })

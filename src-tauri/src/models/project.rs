@@ -15,6 +15,15 @@ pub struct NormalizedRect {
     pub height: f64,
 }
 
+fn default_normalized_rect() -> NormalizedRect {
+    NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+    }
+}
+
 /// Easing-функция для анимации зума.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -31,6 +40,14 @@ impl Default for ZoomEasing {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanKeyframe {
+    pub ts: u64,
+    pub offset_x: f64,
+    pub offset_y: f64,
+}
+
 /// Один зум-сегмент на таймлайне.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,9 +58,14 @@ pub struct ZoomSegment {
     /// Конец сегмента (мс).
     pub end_ts: u64,
     /// Целевая область просмотра (нормализованные координаты).
-    pub target_rect: NormalizedRect,
+    #[serde(default = "default_normalized_rect", alias = "targetRect")]
+    pub initial_rect: NormalizedRect,
+    #[serde(default)]
+    pub pan_trajectory: Vec<PanKeyframe>,
+    #[serde(default)]
     pub easing: ZoomEasing,
     /// true — создан алгоритмом, false — пользователем вручную.
+    #[serde(default)]
     pub is_auto: bool,
 }
 

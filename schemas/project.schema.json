@@ -69,15 +69,31 @@
       "type": "string",
       "enum": ["linear", "ease-in", "ease-out", "ease-in-out"]
     },
+    "PanKeyframe": {
+      "type": "object",
+      "required": ["ts", "offsetX", "offsetY"],
+      "additionalProperties": false,
+      "properties": {
+        "ts": { "type": "integer", "minimum": 0 },
+        "offsetX": { "type": "number" },
+        "offsetY": { "type": "number" }
+      }
+    },
     "ZoomSegment": {
       "type": "object",
-      "required": ["id", "startTs", "endTs", "targetRect", "easing", "isAuto"],
+      "required": ["id", "startTs", "endTs", "easing", "isAuto"],
       "additionalProperties": false,
+      "anyOf": [{ "required": ["initialRect"] }, { "required": ["targetRect"] }],
       "properties": {
         "id": { "type": "string" },
         "startTs": { "type": "integer", "minimum": 0 },
         "endTs": { "type": "integer", "minimum": 0 },
+        "initialRect": { "$ref": "#/$defs/NormalizedRect" },
         "targetRect": { "$ref": "#/$defs/NormalizedRect" },
+        "panTrajectory": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PanKeyframe" }
+        },
         "easing": { "$ref": "#/$defs/ZoomEasing" },
         "isAuto": { "type": "boolean" }
       }
