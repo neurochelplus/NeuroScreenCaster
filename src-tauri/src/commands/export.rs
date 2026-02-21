@@ -11,9 +11,20 @@ use serde::Serialize;
 use crate::algorithm::cursor_smoothing::smooth_cursor_path;
 use crate::capture::recorder::find_ffmpeg_exe;
 use crate::models::events::{EventsFile, SCHEMA_VERSION as EVENTS_SCHEMA_VERSION};
-use crate::models::project::{NormalizedRect, PanKeyframe, Project, ZoomEasing, SCHEMA_VERSION};
+use crate::models::project::{
+    CameraSpring, NormalizedRect, PanKeyframe, Project, TargetPoint, ZoomSegment, SCHEMA_VERSION,
+};
 
-const CAMERA_TRANSITION_MS: f64 = 180.0;
+const DEFAULT_SPRING_MASS: f64 = 1.0;
+const DEFAULT_SPRING_STIFFNESS: f64 = 170.0;
+const DEFAULT_SPRING_DAMPING: f64 = 26.0;
+
+#[derive(Debug, Clone, Copy)]
+struct SpringParams {
+    mass: f64,
+    stiffness: f64,
+    damping: f64,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,17 +55,36 @@ impl Default for ExportStatus {
 #[derive(Clone, Default)]
 pub struct ExportState(pub Arc<Mutex<ExportStatus>>);
 
+#[derive(Debug, Clone, Copy)]
+struct AxisSpringState {
+    value: f64,
+    velocity: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AxisSpringSegment {
+    start: f64,
+    velocity: f64,
+    target: f64,
+}
+
 #[derive(Debug, Clone)]
 struct CameraState {
     start_frame: f64,
     end_frame: f64,
-    from_zoom: f64,
-    to_zoom: f64,
-    from_offset_x: f64,
-    to_offset_x: f64,
-    from_offset_y: f64,
-    to_offset_y: f64,
-    easing: ZoomEasing,
+    spring: SpringParams,
+    zoom: AxisSpringSegment,
+    offset_x: AxisSpringSegment,
+    offset_y: AxisSpringSegment,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentRuntime {
+    start_ts: u64,
+    end_ts: u64,
+    base_rect: NormalizedRect,
+    target_points: Vec<TargetPoint>,
+    spring: SpringParams,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -281,6 +311,14 @@ fn execute_ffmpeg_export(
     codec: &str,
     source_duration_ms: u64,
 ) -> Result<(), String> {
+    let filter_script_path = std::env::temp_dir().join(format!("nsc-filter-{}.txt", now_ms()));
+    std::fs::write(&filter_script_path, filter_graph).map_err(|e| {
+        format!(
+            "Failed to write temporary FFmpeg filter script {}: {e}",
+            filter_script_path.display()
+        )
+    })?;
+
     let ffmpeg = find_ffmpeg_exe();
 
     let mut command = Command::new(&ffmpeg);
@@ -288,8 +326,8 @@ fn execute_ffmpeg_export(
         .arg("-y")
         .arg("-i")
         .arg(source_video)
-        .arg("-vf")
-        .arg(filter_graph)
+        .arg("-filter_script:v")
+        .arg(&filter_script_path)
         .arg("-an");
 
     match codec {
@@ -326,7 +364,10 @@ fn execute_ffmpeg_export(
                 .arg("-pix_fmt")
                 .arg("yuv420p");
         }
-        _ => return Err(format!("Unsupported codec: {codec}")),
+        _ => {
+            let _ = std::fs::remove_file(&filter_script_path);
+            return Err(format!("Unsupported codec: {codec}"));
+        }
     };
 
     let mut child = command
@@ -336,6 +377,7 @@ fn execute_ffmpeg_export(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
+            let _ = std::fs::remove_file(&filter_script_path);
             format!(
                 "Failed to start FFmpeg export ({}): {e}",
                 ffmpeg.to_string_lossy()
@@ -366,9 +408,10 @@ fn execute_ffmpeg_export(
         }
     }
 
-    let exit_status = child
-        .wait()
-        .map_err(|e| format!("Failed to wait for FFmpeg export: {e}"))?;
+    let exit_status = child.wait().map_err(|e| {
+        let _ = std::fs::remove_file(&filter_script_path);
+        format!("Failed to wait for FFmpeg export: {e}")
+    })?;
 
     if !exit_status.success() {
         let stderr_excerpt = stderr_tail
@@ -382,6 +425,7 @@ fn execute_ffmpeg_export(
             })
             .cloned()
             .collect::<Vec<_>>();
+        let _ = std::fs::remove_file(&filter_script_path);
         if stderr_excerpt.is_empty() {
             return Err(format!("FFmpeg export failed with status: {exit_status}"));
         }
@@ -391,6 +435,7 @@ fn execute_ffmpeg_export(
         ));
     }
 
+    let _ = std::fs::remove_file(&filter_script_path);
     Ok(())
 }
 
@@ -414,24 +459,11 @@ fn build_export_filter_graph(
         render_fps,
     );
 
-    let zoom_expr = build_camera_value_expr(
-        &camera_states,
-        |state| state.from_zoom,
-        |state| state.to_zoom,
-        1.0,
-    );
-    let offset_x_expr = build_camera_value_expr(
-        &camera_states,
-        |state| state.from_offset_x,
-        |state| state.to_offset_x,
-        0.0,
-    );
-    let offset_y_expr = build_camera_value_expr(
-        &camera_states,
-        |state| state.from_offset_y,
-        |state| state.to_offset_y,
-        0.0,
-    );
+    let zoom_expr = build_camera_value_expr(&camera_states, |state| state.zoom, 1.0, render_fps);
+    let offset_x_expr =
+        build_camera_value_expr(&camera_states, |state| state.offset_x, 0.0, render_fps);
+    let offset_y_expr =
+        build_camera_value_expr(&camera_states, |state| state.offset_y, 0.0, render_fps);
 
     let mut input_chain: Vec<String> = Vec::new();
     let mut cursor_ass_file = None;
@@ -482,117 +514,337 @@ fn build_camera_states(
     source_height: u32,
     source_fps: f64,
 ) -> Vec<CameraState> {
-    let mut segments = project.timeline.zoom_segments.clone();
-    segments.sort_by_key(|segment| segment.start_ts);
+    let safe_fps = source_fps.max(1.0);
+    let runtime_segments = build_runtime_segments(project);
+    let mut anchors = vec![0, project_duration_ms];
+    for segment in &runtime_segments {
+        anchors.push(segment.start_ts);
+        anchors.push(segment.end_ts);
+        anchors.extend(segment.target_points.iter().map(|point| point.ts));
+    }
+    anchors.sort_unstable();
+    anchors.dedup();
 
     let sw = source_width as f64;
     let sh = source_height as f64;
-    let transition_project_ms = CAMERA_TRANSITION_MS.round().max(1.0) as u64;
-    let mut states = Vec::new();
-    let default_camera = (1.0, 0.0, 0.0);
+    let full_rect = NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+    };
+    let default_camera = rect_to_camera_values(full_rect, sw, sh);
+    let default_spring = default_spring_params();
+    let mut zoom_state = AxisSpringState {
+        value: default_camera.0,
+        velocity: 0.0,
+    };
+    let mut offset_x_state = AxisSpringState {
+        value: default_camera.1,
+        velocity: 0.0,
+    };
+    let mut offset_y_state = AxisSpringState {
+        value: default_camera.2,
+        velocity: 0.0,
+    };
 
-    for segment in segments {
-        let start_ts = segment.start_ts.min(project_duration_ms);
-        let end_ts = segment.end_ts.min(project_duration_ms);
+    let mut states: Vec<CameraState> = Vec::new();
+    for pair in anchors.windows(2) {
+        let start_ts = pair[0];
+        let end_ts = pair[1];
         if end_ts <= start_ts {
             continue;
         }
 
-        let entry_end_ts = (start_ts.saturating_add(transition_project_ms)).min(end_ts);
-        let exit_start_ts = if end_ts > entry_end_ts {
-            end_ts
-                .saturating_sub(transition_project_ms)
-                .max(entry_end_ts)
-        } else {
-            entry_end_ts
-        };
+        let (target_camera, spring) =
+            if let Some(segment) = resolve_runtime_segment(&runtime_segments, start_ts) {
+                let target_rect = target_rect_at_ts(segment, start_ts);
+                (rect_to_camera_values(target_rect, sw, sh), segment.spring)
+            } else {
+                (default_camera, default_spring)
+            };
 
-        let mut pan_trajectory = segment.pan_trajectory.clone();
-        pan_trajectory.sort_by_key(|keyframe| keyframe.ts);
-        let base_rect = normalize_segment_rect(segment.initial_rect.clone());
-        let rect_at_ts = |ts: u64| {
-            let (offset_x, offset_y) = pan_offset_at_ts(&pan_trajectory, ts);
-            apply_pan_offset(&base_rect, offset_x, offset_y)
-        };
-
-        let initial_camera = rect_to_camera_values(rect_at_ts(start_ts), sw, sh);
-        push_camera_state(
-            &mut states,
-            start_ts,
-            entry_end_ts,
-            project_duration_ms,
-            source_duration_ms,
-            source_fps,
-            default_camera,
-            initial_camera,
-            segment.easing.clone(),
-        );
-
-        if exit_start_ts > entry_end_ts {
-            let mut anchors = vec![entry_end_ts];
-            anchors.extend(
-                pan_trajectory
-                    .iter()
-                    .filter(|keyframe| keyframe.ts > entry_end_ts && keyframe.ts < exit_start_ts)
-                    .map(|keyframe| keyframe.ts),
-            );
-            anchors.push(exit_start_ts);
-            anchors.sort_unstable();
-            anchors.dedup();
-
-            for pair in anchors.windows(2) {
-                let from_ts = pair[0];
-                let to_ts = pair[1];
-                if to_ts <= from_ts {
-                    continue;
-                }
-
-                let from_camera = rect_to_camera_values(rect_at_ts(from_ts), sw, sh);
-                let to_camera = rect_to_camera_values(rect_at_ts(to_ts), sw, sh);
-                push_camera_state(
-                    &mut states,
-                    from_ts,
-                    to_ts,
-                    project_duration_ms,
-                    source_duration_ms,
-                    source_fps,
-                    from_camera,
-                    to_camera,
-                    segment.easing.clone(),
-                );
-            }
+        let start_ms = map_time_ms(start_ts, project_duration_ms, source_duration_ms);
+        let end_ms = map_time_ms(end_ts, project_duration_ms, source_duration_ms);
+        if end_ms <= start_ms {
+            continue;
         }
 
-        if end_ts > exit_start_ts {
-            let exit_camera = rect_to_camera_values(rect_at_ts(exit_start_ts), sw, sh);
-            push_camera_state(
-                &mut states,
-                exit_start_ts,
-                end_ts,
-                project_duration_ms,
-                source_duration_ms,
-                source_fps,
-                exit_camera,
-                default_camera,
-                segment.easing,
-            );
+        let start_frame = start_ms as f64 / 1000.0 * safe_fps;
+        let end_frame = end_ms as f64 / 1000.0 * safe_fps;
+        if end_frame <= start_frame {
+            continue;
         }
+
+        states.push(CameraState {
+            start_frame,
+            end_frame,
+            spring,
+            zoom: AxisSpringSegment {
+                start: zoom_state.value,
+                velocity: zoom_state.velocity,
+                target: target_camera.0,
+            },
+            offset_x: AxisSpringSegment {
+                start: offset_x_state.value,
+                velocity: offset_x_state.velocity,
+                target: target_camera.1,
+            },
+            offset_y: AxisSpringSegment {
+                start: offset_y_state.value,
+                velocity: offset_y_state.velocity,
+                target: target_camera.2,
+            },
+        });
+
+        let dt_seconds = (end_frame - start_frame).max(0.0) / safe_fps;
+        zoom_state = evaluate_spring_axis(zoom_state, target_camera.0, spring, dt_seconds);
+        offset_x_state = evaluate_spring_axis(offset_x_state, target_camera.1, spring, dt_seconds);
+        offset_y_state = evaluate_spring_axis(offset_y_state, target_camera.2, spring, dt_seconds);
     }
-
-    states.sort_by(|left, right| {
-        left.start_frame
-            .total_cmp(&right.start_frame)
-            .then_with(|| left.end_frame.total_cmp(&right.end_frame))
-    });
 
     states
 }
 
+fn build_runtime_segments(project: &Project) -> Vec<SegmentRuntime> {
+    let mut segments = project.timeline.zoom_segments.clone();
+    segments.sort_by_key(|segment| segment.start_ts);
+
+    let mut runtime: Vec<SegmentRuntime> = Vec::new();
+    for segment in segments {
+        let start_ts = segment.start_ts.min(project.duration_ms);
+        let end_ts = segment.end_ts.min(project.duration_ms);
+        if end_ts <= start_ts {
+            continue;
+        }
+
+        let base_rect = normalize_segment_rect(segment.initial_rect.clone());
+        let target_points = if segment.target_points.is_empty() {
+            normalize_target_points(
+                target_points_from_legacy_pan(&segment, &base_rect),
+                start_ts,
+                end_ts,
+                &base_rect,
+            )
+        } else {
+            normalize_target_points(segment.target_points.clone(), start_ts, end_ts, &base_rect)
+        };
+
+        runtime.push(SegmentRuntime {
+            start_ts,
+            end_ts,
+            base_rect,
+            target_points,
+            spring: normalize_spring_params(&segment.spring),
+        });
+    }
+
+    runtime.sort_by_key(|segment| segment.start_ts);
+    runtime
+}
+
+fn normalize_target_points(
+    points: Vec<TargetPoint>,
+    start_ts: u64,
+    end_ts: u64,
+    fallback_rect: &NormalizedRect,
+) -> Vec<TargetPoint> {
+    let mut normalized = points
+        .into_iter()
+        .map(|point| TargetPoint {
+            ts: point.ts.clamp(start_ts, end_ts),
+            rect: normalize_segment_rect(point.rect),
+        })
+        .collect::<Vec<_>>();
+    normalized.sort_by_key(|point| point.ts);
+
+    let mut dedup: Vec<TargetPoint> = Vec::new();
+    for point in normalized {
+        if let Some(last) = dedup.last_mut() {
+            if last.ts == point.ts {
+                *last = point;
+                continue;
+            }
+        }
+        dedup.push(point);
+    }
+
+    if dedup.is_empty() {
+        return vec![
+            TargetPoint {
+                ts: start_ts,
+                rect: fallback_rect.clone(),
+            },
+            TargetPoint {
+                ts: end_ts,
+                rect: fallback_rect.clone(),
+            },
+        ];
+    }
+
+    if dedup.first().is_some_and(|point| point.ts > start_ts) {
+        let rect = dedup[0].rect.clone();
+        dedup.insert(0, TargetPoint { ts: start_ts, rect });
+    }
+
+    if dedup.last().is_some_and(|point| point.ts < end_ts) {
+        let rect = dedup
+            .last()
+            .expect("target points has last element")
+            .rect
+            .clone();
+        dedup.push(TargetPoint { ts: end_ts, rect });
+    }
+
+    dedup
+}
+
+fn target_points_from_legacy_pan(
+    segment: &ZoomSegment,
+    base_rect: &NormalizedRect,
+) -> Vec<TargetPoint> {
+    let mut pan_trajectory = segment.pan_trajectory.clone();
+    pan_trajectory.sort_by_key(|keyframe| keyframe.ts);
+
+    if pan_trajectory.is_empty() {
+        return vec![
+            TargetPoint {
+                ts: segment.start_ts,
+                rect: base_rect.clone(),
+            },
+            TargetPoint {
+                ts: segment.end_ts,
+                rect: base_rect.clone(),
+            },
+        ];
+    }
+
+    let (start_offset_x, start_offset_y) = pan_offset_at_ts(&pan_trajectory, segment.start_ts);
+    let mut points = vec![TargetPoint {
+        ts: segment.start_ts,
+        rect: apply_pan_offset(base_rect, start_offset_x, start_offset_y),
+    }];
+
+    for keyframe in &pan_trajectory {
+        if keyframe.ts < segment.start_ts || keyframe.ts > segment.end_ts {
+            continue;
+        }
+        points.push(TargetPoint {
+            ts: keyframe.ts,
+            rect: apply_pan_offset(base_rect, keyframe.offset_x, keyframe.offset_y),
+        });
+    }
+
+    let (end_offset_x, end_offset_y) = pan_offset_at_ts(&pan_trajectory, segment.end_ts);
+    points.push(TargetPoint {
+        ts: segment.end_ts,
+        rect: apply_pan_offset(base_rect, end_offset_x, end_offset_y),
+    });
+    points
+}
+
+fn resolve_runtime_segment<'a>(
+    segments: &'a [SegmentRuntime],
+    ts: u64,
+) -> Option<&'a SegmentRuntime> {
+    segments
+        .iter()
+        .rev()
+        .find(|segment| ts >= segment.start_ts && ts < segment.end_ts)
+}
+
+fn target_rect_at_ts(segment: &SegmentRuntime, ts: u64) -> NormalizedRect {
+    if segment.target_points.is_empty() {
+        return segment.base_rect.clone();
+    }
+    if ts <= segment.target_points[0].ts {
+        return segment.target_points[0].rect.clone();
+    }
+    for point in segment.target_points.iter().rev() {
+        if ts >= point.ts {
+            return point.rect.clone();
+        }
+    }
+    segment.target_points[0].rect.clone()
+}
+
+fn default_spring_params() -> SpringParams {
+    SpringParams {
+        mass: DEFAULT_SPRING_MASS,
+        stiffness: DEFAULT_SPRING_STIFFNESS,
+        damping: DEFAULT_SPRING_DAMPING,
+    }
+}
+
+fn normalize_spring_params(spring: &CameraSpring) -> SpringParams {
+    SpringParams {
+        mass: spring.mass.max(0.001),
+        stiffness: spring.stiffness.max(0.001),
+        damping: spring.damping.max(0.0),
+    }
+}
+
+fn evaluate_spring_axis(
+    state: AxisSpringState,
+    target: f64,
+    spring: SpringParams,
+    dt_seconds: f64,
+) -> AxisSpringState {
+    let dt = dt_seconds.max(0.0);
+    if dt <= 0.0 {
+        return state;
+    }
+
+    let mass = spring.mass.max(0.001);
+    let stiffness = spring.stiffness.max(0.001);
+    let damping = spring.damping.max(0.0);
+    let y0 = state.value - target;
+    let v0 = state.velocity;
+    let alpha = damping / (2.0 * mass);
+    let omega_sq = stiffness / mass;
+    let discriminant = alpha * alpha - omega_sq;
+
+    let (y, v) = if discriminant.abs() <= 1e-9 {
+        let c2 = v0 + alpha * y0;
+        let exp = (-alpha * dt).exp();
+        let y = (y0 + c2 * dt) * exp;
+        let v = (v0 - alpha * c2 * dt) * exp;
+        (y, v)
+    } else if discriminant > 0.0 {
+        let sqrt_disc = discriminant.sqrt();
+        let r1 = -alpha + sqrt_disc;
+        let r2 = -alpha - sqrt_disc;
+        let denom = (r1 - r2).abs().max(1e-9);
+        let c1 = (v0 - r2 * y0) / denom;
+        let c2 = y0 - c1;
+        let exp1 = (r1 * dt).exp();
+        let exp2 = (r2 * dt).exp();
+        let y = c1 * exp1 + c2 * exp2;
+        let v = c1 * r1 * exp1 + c2 * r2 * exp2;
+        (y, v)
+    } else {
+        let beta = (omega_sq - alpha * alpha).max(1e-9).sqrt();
+        let c1 = y0;
+        let c2 = (v0 + alpha * y0) / beta;
+        let exp = (-alpha * dt).exp();
+        let cos = (beta * dt).cos();
+        let sin = (beta * dt).sin();
+        let y = exp * (c1 * cos + c2 * sin);
+        let v = exp * ((-alpha) * (c1 * cos + c2 * sin) + (-c1 * beta * sin + c2 * beta * cos));
+        (y, v)
+    };
+
+    AxisSpringState {
+        value: target + y,
+        velocity: v,
+    }
+}
+
 fn build_camera_value_expr(
     states: &[CameraState],
-    from_value: impl Fn(&CameraState) -> f64,
-    to_value: impl Fn(&CameraState) -> f64,
+    axis: impl Fn(&CameraState) -> AxisSpringSegment,
     default_value: f64,
+    source_fps: f64,
 ) -> String {
     let mut expr = format_f64(default_value);
     let mut ordered = states.to_vec();
@@ -601,27 +853,22 @@ fn build_camera_value_expr(
             .total_cmp(&right.start_frame)
             .then_with(|| left.end_frame.total_cmp(&right.end_frame))
     });
+    let safe_fps = source_fps.max(1.0);
 
     for state in ordered {
-        let duration = (state.end_frame - state.start_frame).max(1.0);
-        let progress = format!(
-            "max(0,min(1,(n-{start})/{duration}))",
+        let axis_state = axis(&state);
+        let elapsed = format!(
+            "max(0,(n-{start})/{fps})",
             start = format_f64(state.start_frame),
-            duration = format_f64(duration)
+            fps = format_f64(safe_fps)
         );
-        let eased_progress = easing_progress_expr(&progress, &state.easing);
-        let interpolated = format!(
-            "{from}+({to}-{from})*({progress})",
-            from = format_f64(from_value(&state)),
-            to = format_f64(to_value(&state)),
-            progress = eased_progress
-        );
+        let value = spring_value_expr(&elapsed, axis_state, state.spring);
 
         expr = format!(
             "if(between(n,{start},{end}),{value},{rest})",
             start = format_f64(state.start_frame),
             end = format_f64(state.end_frame),
-            value = interpolated,
+            value = value,
             rest = expr
         );
     }
@@ -629,38 +876,62 @@ fn build_camera_value_expr(
     expr
 }
 
-fn push_camera_state(
-    states: &mut Vec<CameraState>,
-    start_ts: u64,
-    end_ts: u64,
-    project_duration_ms: u64,
-    source_duration_ms: u64,
-    source_fps: f64,
-    from: (f64, f64, f64),
-    to: (f64, f64, f64),
-    easing: ZoomEasing,
-) {
-    if end_ts <= start_ts {
-        return;
+fn spring_value_expr(
+    elapsed_expr: &str,
+    axis_state: AxisSpringSegment,
+    spring: SpringParams,
+) -> String {
+    let mass = spring.mass.max(0.001);
+    let stiffness = spring.stiffness.max(0.001);
+    let damping = spring.damping.max(0.0);
+    let y0 = axis_state.start - axis_state.target;
+    let v0 = axis_state.velocity;
+    let alpha = damping / (2.0 * mass);
+    let omega_sq = stiffness / mass;
+    let discriminant = alpha * alpha - omega_sq;
+
+    if discriminant.abs() <= 1e-9 {
+        let c2 = v0 + alpha * y0;
+        return format!(
+            "{target}+(({y0})+({c2})*({t}))*exp(-{alpha}*({t}))",
+            target = format_f64(axis_state.target),
+            y0 = format_f64(y0),
+            c2 = format_f64(c2),
+            alpha = format_f64(alpha),
+            t = elapsed_expr
+        );
     }
 
-    let start_ms = map_time_ms(start_ts, project_duration_ms, source_duration_ms);
-    let end_ms = map_time_ms(end_ts, project_duration_ms, source_duration_ms);
-    if end_ms <= start_ms {
-        return;
+    if discriminant > 0.0 {
+        let sqrt_disc = discriminant.sqrt();
+        let r1 = -alpha + sqrt_disc;
+        let r2 = -alpha - sqrt_disc;
+        let denom = (r1 - r2).abs().max(1e-9);
+        let c1 = (v0 - r2 * y0) / denom;
+        let c2 = y0 - c1;
+        return format!(
+            "{target}+({c1})*exp({r1}*({t}))+({c2})*exp({r2}*({t}))",
+            target = format_f64(axis_state.target),
+            c1 = format_f64(c1),
+            c2 = format_f64(c2),
+            r1 = format_f64(r1),
+            r2 = format_f64(r2),
+            t = elapsed_expr
+        );
     }
 
-    states.push(CameraState {
-        start_frame: start_ms as f64 / 1000.0 * source_fps,
-        end_frame: end_ms as f64 / 1000.0 * source_fps,
-        from_zoom: from.0,
-        to_zoom: to.0,
-        from_offset_x: from.1,
-        to_offset_x: to.1,
-        from_offset_y: from.2,
-        to_offset_y: to.2,
-        easing,
-    });
+    let beta = (omega_sq - alpha * alpha).max(1e-9).sqrt();
+    let c1 = y0;
+    let c2 = (v0 + alpha * y0) / beta;
+    format!(
+        "{target}+exp(-{alpha}*({t}))*(({c1})*cos({beta}*({t}))+({c2})*sin({beta}*({t})))",
+        target = format_f64(axis_state.target),
+        alpha = format_f64(alpha),
+        c1 = format_f64(c1),
+        c2 = format_f64(c2),
+        beta = format_f64(beta),
+        t = elapsed_expr
+    )
 }
 
 fn rect_to_camera_values(
@@ -744,20 +1015,6 @@ fn pan_offset_at_ts(pan_trajectory: &[PanKeyframe], ts: u64) -> (f64, f64) {
     }
 
     (last.offset_x, last.offset_y)
-}
-
-fn easing_progress_expr(t_expr: &str, easing: &ZoomEasing) -> String {
-    match easing {
-        ZoomEasing::Linear => t_expr.to_string(),
-        ZoomEasing::EaseIn => format!("({t})*({t})", t = t_expr),
-        ZoomEasing::EaseOut => format!("1-(1-({t}))*(1-({t}))", t = t_expr),
-        ZoomEasing::EaseInOut => {
-            format!(
-                "if(lt({t},0.5),2*({t})*({t}),1-pow(-2*({t})+2,2)/2)",
-                t = t_expr
-            )
-        }
-    }
 }
 
 fn format_f64(value: f64) -> String {
@@ -1179,8 +1436,8 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::models::project::{
-        Background, CursorSettings, ExportSettings, NormalizedRect, ProjectSettings, Timeline,
-        ZoomEasing, ZoomSegment,
+        Background, CameraSpring, CursorSettings, ExportSettings, NormalizedRect, ProjectSettings,
+        Timeline, ZoomSegment,
     };
 
     fn sample_project() -> Project {
@@ -1205,8 +1462,14 @@ mod tests {
                         width: 0.2,
                         height: 0.2,
                     },
+                    target_points: vec![],
+                    spring: CameraSpring {
+                        mass: 1.0,
+                        stiffness: 170.0,
+                        damping: 26.0,
+                    },
                     pan_trajectory: vec![],
-                    easing: ZoomEasing::EaseInOut,
+                    legacy_easing: None,
                     is_auto: true,
                 }],
             },
@@ -1215,6 +1478,24 @@ mod tests {
                 background: Background::default(),
                 export: ExportSettings::default(),
             },
+        }
+    }
+
+    fn zoom_segment(id: &str, start_ts: u64, end_ts: u64, rect: NormalizedRect) -> ZoomSegment {
+        ZoomSegment {
+            id: id.to_string(),
+            start_ts,
+            end_ts,
+            initial_rect: rect,
+            target_points: vec![],
+            spring: CameraSpring {
+                mass: 1.0,
+                stiffness: 170.0,
+                damping: 26.0,
+            },
+            pan_trajectory: vec![],
+            legacy_easing: None,
+            is_auto: true,
         }
     }
 
@@ -1228,11 +1509,50 @@ mod tests {
         assert!(cursor_file.is_none());
         assert!(graph.contains("split=2[base][zoom]"));
         assert!(graph.contains("scale=w='iw*("));
-        assert!(graph.contains("pow("));
+        assert!(graph.contains("exp("));
         assert!(graph.contains("eval=frame"));
         assert!(graph.contains("[base][scaled]overlay=x='-max(0,min("));
         assert!(graph.contains("overlay_h-main_h"));
         assert!(graph.contains("fps=30"));
+    }
+
+    #[test]
+    fn camera_returns_to_fullscreen_between_separated_segments() {
+        let mut project = sample_project();
+        project.timeline.zoom_segments = vec![
+            zoom_segment(
+                "z1",
+                1_000,
+                2_000,
+                NormalizedRect {
+                    x: 0.4,
+                    y: 0.3,
+                    width: 0.2,
+                    height: 0.2,
+                },
+            ),
+            zoom_segment(
+                "z2",
+                4_000,
+                5_000,
+                NormalizedRect {
+                    x: 0.2,
+                    y: 0.2,
+                    width: 0.25,
+                    height: 0.25,
+                },
+            ),
+        ];
+
+        let states = build_camera_states(&project, 10_000, 10_000, 1_920, 1_080, 30.0);
+        let gap_state = states
+            .iter()
+            .find(|state| state.start_frame >= 60.0 - 0.01 && state.start_frame <= 60.0 + 0.01)
+            .expect("expected camera state at first segment end");
+
+        assert!((gap_state.zoom.target - 1.0).abs() < 0.0001);
+        assert!(gap_state.offset_x.target.abs() < 0.0001);
+        assert!(gap_state.offset_y.target.abs() < 0.0001);
     }
 
     #[test]

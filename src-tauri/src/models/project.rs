@@ -24,28 +24,37 @@ fn default_normalized_rect() -> NormalizedRect {
     }
 }
 
-/// Easing-функция для анимации зума.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ZoomEasing {
-    Linear,
-    EaseIn,
-    EaseOut,
-    EaseInOut,
-}
-
-impl Default for ZoomEasing {
-    fn default() -> Self {
-        ZoomEasing::EaseInOut
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PanKeyframe {
     pub ts: u64,
     pub offset_x: f64,
     pub offset_y: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetPoint {
+    pub ts: u64,
+    pub rect: NormalizedRect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraSpring {
+    pub mass: f64,
+    pub stiffness: f64,
+    pub damping: f64,
+}
+
+impl Default for CameraSpring {
+    fn default() -> Self {
+        Self {
+            mass: 1.0,
+            stiffness: 170.0,
+            damping: 26.0,
+        }
+    }
 }
 
 /// Один зум-сегмент на таймлайне.
@@ -60,10 +69,16 @@ pub struct ZoomSegment {
     /// Целевая область просмотра (нормализованные координаты).
     #[serde(default = "default_normalized_rect", alias = "targetRect")]
     pub initial_rect: NormalizedRect,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_points: Vec<TargetPoint>,
     #[serde(default)]
+    pub spring: CameraSpring,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(alias = "panTrajectory")]
     pub pan_trajectory: Vec<PanKeyframe>,
-    #[serde(default)]
-    pub easing: ZoomEasing,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "easing")]
+    pub legacy_easing: Option<String>,
     /// true — создан алгоритмом, false — пользователем вручную.
     #[serde(default)]
     pub is_auto: bool,

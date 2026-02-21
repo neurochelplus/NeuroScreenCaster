@@ -15,14 +15,23 @@ export interface NormalizedRect {
   height: number;
 }
 
-export type ZoomEasing = "linear" | "ease-in" | "ease-out" | "ease-in-out";
-
 // --- Таймлайн ---
 
 export interface PanKeyframe {
   ts: number;
   offsetX: number;
   offsetY: number;
+}
+
+export interface TargetPoint {
+  ts: number;
+  rect: NormalizedRect;
+}
+
+export interface CameraSpring {
+  mass: number;
+  stiffness: number;
+  damping: number;
 }
 
 export interface ZoomSegment {
@@ -34,8 +43,9 @@ export interface ZoomSegment {
   /** Целевая область просмотра (нормализованные координаты). */
   initialRect?: NormalizedRect;
   targetRect?: NormalizedRect;
+  targetPoints?: TargetPoint[];
+  spring?: CameraSpring;
   panTrajectory?: PanKeyframe[];
-  easing: ZoomEasing;
   /** true — создан алгоритмом авто-зума; false — пользователем вручную. */
   isAuto: boolean;
 }

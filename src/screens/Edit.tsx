@@ -2,7 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { dirname, isAbsolute, join } from "@tauri-apps/api/path";
 import type { EventsFile } from "../types/events";
-import type { NormalizedRect, PanKeyframe, Project, ZoomSegment } from "../types/project";
+import type {
+  CameraSpring,
+  NormalizedRect,
+  PanKeyframe,
+  Project,
+  TargetPoint,
+  ZoomSegment,
+} from "../types/project";
 import "./Edit.css";
 
 interface ProjectListItem {
@@ -42,11 +49,28 @@ interface SegmentDragState {
   initialEndTs: number;
 }
 
+interface RuntimeSegment {
+  id: string;
+  startTs: number;
+  endTs: number;
+  isAuto: boolean;
+  baseRect: NormalizedRect;
+  targetPoints: TargetPoint[];
+  spring: CameraSpring;
+}
+
+interface SpringCameraSample {
+  ts: number;
+  rect: NormalizedRect;
+}
+
 const DEFAULT_RECT: NormalizedRect = { x: 0.2, y: 0.2, width: 0.6, height: 0.6 };
 const FULL_RECT: NormalizedRect = { x: 0, y: 0, width: 1, height: 1 };
+const DEFAULT_SPRING: CameraSpring = { mass: 1, stiffness: 170, damping: 26 };
 const MIN_RECT_SIZE = 0.05;
 const MIN_SEGMENT_MS = 200;
 const PLAYHEAD_SYNC_THRESHOLD_MS = 12;
+const PREVIEW_SPRING_FPS = 60;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -62,6 +86,25 @@ function normalizeRect(rect: NormalizedRect): NormalizedRect {
 
 function getSegmentBaseRect(segment: ZoomSegment): NormalizedRect {
   return normalizeRect(segment.initialRect ?? segment.targetRect ?? DEFAULT_RECT);
+}
+
+function normalizeSpring(spring: CameraSpring | undefined): CameraSpring {
+  if (!spring) {
+    return DEFAULT_SPRING;
+  }
+  return {
+    mass: clamp(Number.isFinite(spring.mass) ? spring.mass : DEFAULT_SPRING.mass, 0.001, 50),
+    stiffness: clamp(
+      Number.isFinite(spring.stiffness) ? spring.stiffness : DEFAULT_SPRING.stiffness,
+      0.001,
+      5_000
+    ),
+    damping: clamp(
+      Number.isFinite(spring.damping) ? spring.damping : DEFAULT_SPRING.damping,
+      0,
+      500
+    ),
+  };
 }
 
 function getSortedPanTrajectory(segment: ZoomSegment): PanKeyframe[] {
@@ -100,7 +143,7 @@ function panOffsetAtTime(trajectory: PanKeyframe[], ts: number): { offsetX: numb
   return { offsetX: last.offsetX, offsetY: last.offsetY };
 }
 
-function getSegmentRectAtTimelineTs(segment: ZoomSegment, timelineTs: number): NormalizedRect {
+function getLegacyPanRectAtTimelineTs(segment: ZoomSegment, timelineTs: number): NormalizedRect {
   const base = getSegmentBaseRect(segment);
   const { offsetX, offsetY } = panOffsetAtTime(getSortedPanTrajectory(segment), timelineTs);
 
@@ -112,11 +155,210 @@ function getSegmentRectAtTimelineTs(segment: ZoomSegment, timelineTs: number): N
   });
 }
 
+function getSegmentTargetPoints(segment: ZoomSegment): TargetPoint[] {
+  const explicitPoints = (segment.targetPoints ?? [])
+    .map((point) => ({
+      ts: clamp(point.ts, segment.startTs, segment.endTs),
+      rect: normalizeRect(point.rect),
+    }))
+    .sort((a, b) => a.ts - b.ts);
+
+  if (explicitPoints.length > 0) {
+    const points: TargetPoint[] = [];
+    if (explicitPoints[0].ts > segment.startTs) {
+      points.push({ ts: segment.startTs, rect: explicitPoints[0].rect });
+    }
+    points.push(...explicitPoints);
+    const last = points[points.length - 1];
+    if (last.ts < segment.endTs) {
+      points.push({ ts: segment.endTs, rect: last.rect });
+    }
+    return points;
+  }
+
+  const legacyPan = getSortedPanTrajectory(segment);
+  if (legacyPan.length === 0) {
+    const baseRect = getSegmentBaseRect(segment);
+    return [
+      { ts: segment.startTs, rect: baseRect },
+      { ts: segment.endTs, rect: baseRect },
+    ];
+  }
+
+  const points: TargetPoint[] = [];
+  const startRect = getLegacyPanRectAtTimelineTs(segment, segment.startTs);
+  points.push({ ts: segment.startTs, rect: startRect });
+  for (const keyframe of legacyPan) {
+    if (keyframe.ts < segment.startTs || keyframe.ts > segment.endTs) {
+      continue;
+    }
+    points.push({
+      ts: keyframe.ts,
+      rect: getLegacyPanRectAtTimelineTs(segment, keyframe.ts),
+    });
+  }
+  const endRect = getLegacyPanRectAtTimelineTs(segment, segment.endTs);
+  points.push({ ts: segment.endTs, rect: endRect });
+  points.sort((a, b) => a.ts - b.ts);
+  return points;
+}
+
+function getTargetRectAtTs(segment: RuntimeSegment, timelineTs: number): NormalizedRect {
+  if (segment.targetPoints.length === 0) {
+    return segment.baseRect;
+  }
+  if (timelineTs <= segment.targetPoints[0].ts) {
+    return segment.targetPoints[0].rect;
+  }
+  const last = segment.targetPoints[segment.targetPoints.length - 1];
+  if (timelineTs >= last.ts) {
+    return last.rect;
+  }
+  for (let index = segment.targetPoints.length - 1; index >= 0; index -= 1) {
+    const point = segment.targetPoints[index];
+    if (timelineTs >= point.ts) {
+      return point.rect;
+    }
+  }
+  return segment.targetPoints[0].rect;
+}
+
+function toRuntimeSegments(segments: ZoomSegment[]): RuntimeSegment[] {
+  return [...segments]
+    .sort((a, b) => a.startTs - b.startTs)
+    .map((segment) => ({
+      id: segment.id,
+      startTs: segment.startTs,
+      endTs: segment.endTs,
+      isAuto: segment.isAuto,
+      baseRect: getSegmentBaseRect(segment),
+      targetPoints: getSegmentTargetPoints(segment),
+      spring: normalizeSpring(segment.spring),
+    }));
+}
+
+function resolveRuntimeSegment(segments: RuntimeSegment[], timelineTs: number): RuntimeSegment | null {
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    if (timelineTs >= segment.startTs && timelineTs < segment.endTs) {
+      return segment;
+    }
+  }
+  return null;
+}
+
+function springStep(
+  current: number,
+  velocity: number,
+  target: number,
+  spring: CameraSpring,
+  dtSeconds: number
+): { value: number; velocity: number } {
+  const safeDt = clamp(dtSeconds, 0.0001, 0.1);
+  const accel =
+    ((target - current) * spring.stiffness - spring.damping * velocity) / spring.mass;
+  const nextVelocity = velocity + accel * safeDt;
+  return {
+    value: current + nextVelocity * safeDt,
+    velocity: nextVelocity,
+  };
+}
+
+function buildSpringCameraTrack(
+  runtimeSegments: RuntimeSegment[],
+  durationMs: number,
+  fps = PREVIEW_SPRING_FPS
+): SpringCameraSample[] {
+  if (durationMs <= 0) {
+    return [{ ts: 0, rect: FULL_RECT }];
+  }
+
+  const stepMs = 1000 / Math.max(1, fps);
+  const frameCount = Math.max(1, Math.ceil(durationMs / stepMs));
+  const samples: SpringCameraSample[] = [];
+  let rect = { ...FULL_RECT };
+  let vx = 0;
+  let vy = 0;
+  let vw = 0;
+  let vh = 0;
+  let previousTs = 0;
+
+  for (let frame = 0; frame <= frameCount; frame += 1) {
+    const ts = Math.min(Math.round(frame * stepMs), durationMs);
+    const activeSegment = resolveRuntimeSegment(runtimeSegments, ts);
+    const targetRect = activeSegment ? getTargetRectAtTs(activeSegment, ts) : FULL_RECT;
+    const spring = activeSegment?.spring ?? DEFAULT_SPRING;
+    const dtSeconds = (ts - previousTs) / 1000;
+    previousTs = ts;
+
+    const stepX = springStep(rect.x, vx, targetRect.x, spring, dtSeconds);
+    rect.x = stepX.value;
+    vx = stepX.velocity;
+
+    const stepY = springStep(rect.y, vy, targetRect.y, spring, dtSeconds);
+    rect.y = stepY.value;
+    vy = stepY.velocity;
+
+    const stepW = springStep(rect.width, vw, targetRect.width, spring, dtSeconds);
+    rect.width = stepW.value;
+    vw = stepW.velocity;
+
+    const stepH = springStep(rect.height, vh, targetRect.height, spring, dtSeconds);
+    rect.height = stepH.value;
+    vh = stepH.velocity;
+
+    rect = normalizeRect(rect);
+    samples.push({ ts, rect });
+  }
+
+  return samples;
+}
+
+function sampleCameraTrack(track: SpringCameraSample[], ts: number): NormalizedRect {
+  if (track.length === 0) {
+    return FULL_RECT;
+  }
+  if (ts <= track[0].ts) {
+    return track[0].rect;
+  }
+  const last = track[track.length - 1];
+  if (ts >= last.ts) {
+    return last.rect;
+  }
+
+  let low = 0;
+  let high = track.length - 1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (track[mid].ts === ts) {
+      return track[mid].rect;
+    }
+    if (track[mid].ts < ts) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  const next = track[low];
+  const prev = track[Math.max(0, low - 1)];
+  const span = Math.max(1, next.ts - prev.ts);
+  const t = (ts - prev.ts) / span;
+  return normalizeRect({
+    x: prev.rect.x + (next.rect.x - prev.rect.x) * t,
+    y: prev.rect.y + (next.rect.y - prev.rect.y) * t,
+    width: prev.rect.width + (next.rect.width - prev.rect.width) * t,
+    height: prev.rect.height + (next.rect.height - prev.rect.height) * t,
+  });
+}
+
 function updateSegmentBaseRect(segment: ZoomSegment, rect: NormalizedRect): ZoomSegment {
   const { targetRect: _legacyTargetRect, ...rest } = segment;
   return {
     ...rest,
     initialRect: normalizeRect(rect),
+    spring: normalizeSpring(segment.spring),
+    targetPoints: [],
     panTrajectory: [],
   };
 }
@@ -368,6 +610,7 @@ export default function EditScreen() {
     () => sortSegments(project?.timeline.zoomSegments ?? []),
     [project?.timeline.zoomSegments]
   );
+  const runtimeSegments = useMemo(() => toRuntimeSegments(timelineSegments), [timelineSegments]);
 
   const selectedSegment = useMemo(() => {
     if (!project || !selectedSegmentId) {
@@ -375,17 +618,6 @@ export default function EditScreen() {
     }
     return project.timeline.zoomSegments.find((segment) => segment.id === selectedSegmentId) ?? null;
   }, [project, selectedSegmentId]);
-
-  const activeSegment = useMemo(() => {
-    if (!project) {
-      return null;
-    }
-    return (
-      project.timeline.zoomSegments.find(
-        (segment) => playheadTimelineMs >= segment.startTs && playheadTimelineMs <= segment.endTs
-      ) ?? null
-    );
-  }, [project, playheadTimelineMs]);
 
   const selectedSegmentCenter = useMemo(() => {
     if (!selectedSegment) {
@@ -414,9 +646,14 @@ export default function EditScreen() {
     return 16 / 9;
   }, [selectedSegment, project]);
 
-  const previewRect = activeSegment
-    ? getSegmentRectAtTimelineTs(activeSegment, playheadTimelineMs)
-    : FULL_RECT;
+  const previewCameraTrack = useMemo(
+    () => buildSpringCameraTrack(runtimeSegments, timelineDurationMs),
+    [runtimeSegments, timelineDurationMs]
+  );
+  const previewRect = useMemo(
+    () => sampleCameraTrack(previewCameraTrack, playheadTimelineMs),
+    [previewCameraTrack, playheadTimelineMs]
+  );
   const previewScale = 1 / Math.max(previewRect.width, previewRect.height);
   const centerX = previewRect.x + previewRect.width / 2;
   const centerY = previewRect.y + previewRect.height / 2;
@@ -803,17 +1040,16 @@ export default function EditScreen() {
     const startTs = clamp(playheadTimelineMs, 0, Math.max(0, timelineDurationMs - MIN_SEGMENT_MS));
     const endTs = clamp(startTs + 1600, startTs + MIN_SEGMENT_MS, timelineDurationMs);
     const nextId = `manual-${Date.now()}`;
-    const rect = activeSegment
-      ? getSegmentRectAtTimelineTs(activeSegment, playheadTimelineMs)
-      : DEFAULT_RECT;
+    const rect = previewRect ?? DEFAULT_RECT;
 
     const newSegment: ZoomSegment = {
       id: nextId,
       startTs,
       endTs,
       initialRect: normalizeRect(rect),
+      targetPoints: [],
+      spring: { ...DEFAULT_SPRING },
       panTrajectory: [],
-      easing: "ease-in-out",
       isAuto: false,
     };
 

@@ -65,10 +65,6 @@
         "height": { "type": "number", "minimum": 0, "maximum": 1 }
       }
     },
-    "ZoomEasing": {
-      "type": "string",
-      "enum": ["linear", "ease-in", "ease-out", "ease-in-out"]
-    },
     "PanKeyframe": {
       "type": "object",
       "required": ["ts", "offsetX", "offsetY"],
@@ -79,9 +75,28 @@
         "offsetY": { "type": "number" }
       }
     },
+    "TargetPoint": {
+      "type": "object",
+      "required": ["ts", "rect"],
+      "additionalProperties": false,
+      "properties": {
+        "ts": { "type": "integer", "minimum": 0 },
+        "rect": { "$ref": "#/$defs/NormalizedRect" }
+      }
+    },
+    "CameraSpring": {
+      "type": "object",
+      "required": ["mass", "stiffness", "damping"],
+      "additionalProperties": false,
+      "properties": {
+        "mass": { "type": "number", "exclusiveMinimum": 0 },
+        "stiffness": { "type": "number", "exclusiveMinimum": 0 },
+        "damping": { "type": "number", "minimum": 0 }
+      }
+    },
     "ZoomSegment": {
       "type": "object",
-      "required": ["id", "startTs", "endTs", "easing", "isAuto"],
+      "required": ["id", "startTs", "endTs", "isAuto"],
       "additionalProperties": false,
       "anyOf": [{ "required": ["initialRect"] }, { "required": ["targetRect"] }],
       "properties": {
@@ -90,11 +105,15 @@
         "endTs": { "type": "integer", "minimum": 0 },
         "initialRect": { "$ref": "#/$defs/NormalizedRect" },
         "targetRect": { "$ref": "#/$defs/NormalizedRect" },
+        "targetPoints": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TargetPoint" }
+        },
+        "spring": { "$ref": "#/$defs/CameraSpring" },
         "panTrajectory": {
           "type": "array",
           "items": { "$ref": "#/$defs/PanKeyframe" }
         },
-        "easing": { "$ref": "#/$defs/ZoomEasing" },
         "isAuto": { "type": "boolean" }
       }
     },

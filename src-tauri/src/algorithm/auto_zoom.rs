@@ -1,5 +1,5 @@
 use crate::models::events::{BoundingRect, InputEvent, UiContext};
-use crate::models::project::{NormalizedRect, PanKeyframe, ZoomEasing, ZoomSegment};
+use crate::models::project::{CameraSpring, NormalizedRect, TargetPoint, ZoomSegment};
 
 #[derive(Debug, Clone)]
 pub struct AutoZoomConfig {
@@ -24,7 +24,12 @@ pub struct AutoZoomConfig {
     pub max_ui_rect_area_ratio: f64,
     pub missing_control_max_area_ratio: f64,
     pub missing_control_max_side_ratio: f64,
-    pub scroll_pan_step_ratio: f64,
+    pub scroll_target_step_ratio: f64,
+    pub micro_track_cursor_weight: f64,
+    pub micro_track_sample_ms: u64,
+    pub spring_mass: f64,
+    pub spring_stiffness: f64,
+    pub spring_damping: f64,
 }
 
 impl Default for AutoZoomConfig {
@@ -51,7 +56,12 @@ impl Default for AutoZoomConfig {
             max_ui_rect_area_ratio: 0.45,
             missing_control_max_area_ratio: 0.25,
             missing_control_max_side_ratio: 0.72,
-            scroll_pan_step_ratio: 0.10,
+            scroll_target_step_ratio: 0.10,
+            micro_track_cursor_weight: 0.10,
+            micro_track_sample_ms: 90,
+            spring_mass: 1.0,
+            spring_stiffness: 170.0,
+            spring_damping: 26.0,
         }
     }
 }
@@ -446,12 +456,14 @@ pub fn build_auto_zoom_segments_with_context_and_config(
             continue;
         }
 
-        let pan_trajectory = build_pan_trajectory(
+        let target_points = build_target_points(
             start_ts,
             end_ts,
+            &pointer_samples,
             &scroll_samples,
             &initial_rect,
-            config.scroll_pan_step_ratio,
+            metrics,
+            config,
         );
 
         segments.push(ZoomSegment {
@@ -459,8 +471,14 @@ pub fn build_auto_zoom_segments_with_context_and_config(
             start_ts,
             end_ts,
             initial_rect,
-            pan_trajectory,
-            easing: ZoomEasing::EaseInOut,
+            target_points,
+            spring: CameraSpring {
+                mass: config.spring_mass.max(0.001),
+                stiffness: config.spring_stiffness.max(0.001),
+                damping: config.spring_damping.max(0.0),
+            },
+            pan_trajectory: Vec::new(),
+            legacy_easing: None,
             is_auto: true,
         });
 
@@ -735,82 +753,184 @@ fn dynamic_lookahead_ms(config: &AutoZoomConfig, velocity_px_per_ms: f64) -> u64
     (raw.round() as u64).clamp(config.min_lookahead_ms, config.max_lookahead_ms)
 }
 
-fn build_pan_trajectory(
+#[derive(Debug, Clone, Copy)]
+enum TargetEvent {
+    Scroll { ts: u64, dx: f64, dy: f64 },
+    Pointer { ts: u64, x: f64, y: f64 },
+}
+
+impl TargetEvent {
+    fn ts(self) -> u64 {
+        match self {
+            TargetEvent::Scroll { ts, .. } => ts,
+            TargetEvent::Pointer { ts, .. } => ts,
+        }
+    }
+
+    fn order(self) -> u8 {
+        match self {
+            TargetEvent::Scroll { .. } => 0,
+            TargetEvent::Pointer { .. } => 1,
+        }
+    }
+}
+
+fn build_target_points(
     start_ts: u64,
     end_ts: u64,
+    pointers: &[PointerSample],
     scrolls: &[ScrollSample],
     initial_rect: &NormalizedRect,
-    scroll_pan_step_ratio: f64,
-) -> Vec<PanKeyframe> {
+    metrics: ScreenMetrics,
+    config: &AutoZoomConfig,
+) -> Vec<TargetPoint> {
     if start_ts >= end_ts {
         return Vec::new();
     }
 
-    let mut trajectory: Vec<PanKeyframe> = Vec::new();
-    let mut offset_x = 0.0;
-    let mut offset_y = 0.0;
+    let mut target_points: Vec<TargetPoint> = Vec::new();
+    let mut base_rect = normalize_target_rect(initial_rect.clone());
+    push_target_point(
+        &mut target_points,
+        TargetPoint {
+            ts: start_ts,
+            rect: base_rect.clone(),
+        },
+    );
 
-    let min_offset_x = -initial_rect.x;
-    let max_offset_x = (1.0 - initial_rect.width - initial_rect.x).max(min_offset_x);
-    let min_offset_y = -initial_rect.y;
-    let max_offset_y = (1.0 - initial_rect.height - initial_rect.y).max(min_offset_y);
-
+    let mut events: Vec<TargetEvent> = Vec::new();
     for scroll in scrolls {
         if scroll.ts < start_ts || scroll.ts > end_ts {
             continue;
         }
-
-        let normalized_dx = normalize_scroll_delta(scroll.dx);
-        let normalized_dy = normalize_scroll_delta(scroll.dy);
-
-        offset_x += normalized_dx * initial_rect.width * scroll_pan_step_ratio;
-        offset_y += -normalized_dy * initial_rect.height * scroll_pan_step_ratio;
-
-        offset_x = offset_x.clamp(min_offset_x, max_offset_x);
-        offset_y = offset_y.clamp(min_offset_y, max_offset_y);
-
-        push_pan_keyframe(
-            &mut trajectory,
-            PanKeyframe {
-                ts: scroll.ts,
-                offset_x,
-                offset_y,
-            },
-        );
+        events.push(TargetEvent::Scroll {
+            ts: scroll.ts,
+            dx: scroll.dx,
+            dy: scroll.dy,
+        });
     }
 
-    if trajectory.is_empty() {
-        return Vec::new();
+    let mut last_pointer_ts: Option<u64> = None;
+    for pointer in pointers {
+        if pointer.ts < start_ts || pointer.ts > end_ts {
+            continue;
+        }
+        if let Some(last_ts) = last_pointer_ts {
+            if pointer.ts.saturating_sub(last_ts) < config.micro_track_sample_ms {
+                continue;
+            }
+        }
+        last_pointer_ts = Some(pointer.ts);
+        events.push(TargetEvent::Pointer {
+            ts: pointer.ts,
+            x: pointer.x,
+            y: pointer.y,
+        });
     }
 
-    trajectory.insert(
-        0,
-        PanKeyframe {
-            ts: start_ts,
-            offset_x: 0.0,
-            offset_y: 0.0,
-        },
-    );
-    push_pan_keyframe(
-        &mut trajectory,
-        PanKeyframe {
+    events.sort_by(|left, right| {
+        left.ts()
+            .cmp(&right.ts())
+            .then(left.order().cmp(&right.order()))
+    });
+
+    let cursor_weight = config.micro_track_cursor_weight.clamp(0.0, 0.4);
+    for event in events {
+        match event {
+            TargetEvent::Scroll { ts, dx, dy } => {
+                let normalized_dx = normalize_scroll_delta(dx);
+                let normalized_dy = normalize_scroll_delta(dy);
+                let shift_x = normalized_dx * base_rect.width * config.scroll_target_step_ratio;
+                let shift_y = -normalized_dy * base_rect.height * config.scroll_target_step_ratio;
+                base_rect = shift_target_rect(&base_rect, shift_x, shift_y);
+
+                push_target_point(
+                    &mut target_points,
+                    TargetPoint {
+                        ts,
+                        rect: base_rect.clone(),
+                    },
+                );
+            }
+            TargetEvent::Pointer { ts, x, y } => {
+                if cursor_weight <= 0.0 {
+                    continue;
+                }
+
+                let cursor_x = (x / metrics.width).clamp(0.0, 1.0);
+                let cursor_y = (y / metrics.height).clamp(0.0, 1.0);
+                let anchor_center_x = base_rect.x + base_rect.width / 2.0;
+                let anchor_center_y = base_rect.y + base_rect.height / 2.0;
+                let target_center_x =
+                    anchor_center_x * (1.0 - cursor_weight) + cursor_x * cursor_weight;
+                let target_center_y =
+                    anchor_center_y * (1.0 - cursor_weight) + cursor_y * cursor_weight;
+
+                let tracked = recenter_target_rect(&base_rect, target_center_x, target_center_y);
+                push_target_point(&mut target_points, TargetPoint { ts, rect: tracked });
+            }
+        }
+    }
+
+    push_target_point(
+        &mut target_points,
+        TargetPoint {
             ts: end_ts,
-            offset_x,
-            offset_y,
+            rect: base_rect,
         },
     );
 
-    trajectory
+    target_points
 }
 
-fn push_pan_keyframe(trajectory: &mut Vec<PanKeyframe>, keyframe: PanKeyframe) {
-    if let Some(last) = trajectory.last_mut() {
-        if last.ts == keyframe.ts {
-            *last = keyframe;
+fn shift_target_rect(base: &NormalizedRect, shift_x: f64, shift_y: f64) -> NormalizedRect {
+    normalize_target_rect(NormalizedRect {
+        x: base.x + shift_x,
+        y: base.y + shift_y,
+        width: base.width,
+        height: base.height,
+    })
+}
+
+fn recenter_target_rect(base: &NormalizedRect, center_x: f64, center_y: f64) -> NormalizedRect {
+    normalize_target_rect(NormalizedRect {
+        x: center_x - base.width / 2.0,
+        y: center_y - base.height / 2.0,
+        width: base.width,
+        height: base.height,
+    })
+}
+
+fn normalize_target_rect(rect: NormalizedRect) -> NormalizedRect {
+    let width = rect.width.clamp(0.01, 1.0);
+    let height = rect.height.clamp(0.01, 1.0);
+    NormalizedRect {
+        x: rect.x.clamp(0.0, 1.0 - width),
+        y: rect.y.clamp(0.0, 1.0 - height),
+        width,
+        height,
+    }
+}
+
+fn rects_near_equal(left: &NormalizedRect, right: &NormalizedRect) -> bool {
+    const EPSILON: f64 = 0.0006;
+    (left.x - right.x).abs() <= EPSILON
+        && (left.y - right.y).abs() <= EPSILON
+        && (left.width - right.width).abs() <= EPSILON
+        && (left.height - right.height).abs() <= EPSILON
+}
+
+fn push_target_point(target_points: &mut Vec<TargetPoint>, point: TargetPoint) {
+    if let Some(last) = target_points.last_mut() {
+        if last.ts == point.ts {
+            *last = point;
+            return;
+        }
+        if rects_near_equal(&last.rect, &point.rect) {
             return;
         }
     }
-    trajectory.push(keyframe);
+    target_points.push(point);
 }
 
 fn normalize_scroll_delta(raw_delta: f64) -> f64 {
@@ -973,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_pan_trajectory_when_scroll_exists() {
+    fn builds_target_points_when_scroll_exists() {
         let events = vec![
             click(1_000, 400.0, 300.0, None, None),
             InputEvent::Scroll {
@@ -998,13 +1118,17 @@ mod tests {
 
         let segments = build_auto_zoom_segments(&events, 1_920, 1_080, 4_000);
         assert_eq!(segments.len(), 1);
-        assert!(!segments[0].pan_trajectory.is_empty());
+        assert!(!segments[0].target_points.is_empty());
 
+        let first = segments[0]
+            .target_points
+            .first()
+            .expect("target points must have first point");
         let last = segments[0]
-            .pan_trajectory
+            .target_points
             .last()
-            .expect("pan trajectory must have last keyframe");
-        assert!(last.offset_y > 0.0);
+            .expect("target points must have last point");
+        assert!(last.rect.y > first.rect.y);
     }
 
     #[test]
