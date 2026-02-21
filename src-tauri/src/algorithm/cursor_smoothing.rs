@@ -48,9 +48,10 @@ pub fn smooth_cursor_points(points: &[CursorPoint], smoothing_factor: f64) -> Ve
         return points.to_vec();
     }
 
-    let filtered = adaptive_holt_filter(points, factor);
+    let window = (3.0 + (factor * 2.0).round()) as usize;
+    let filtered = simple_moving_average_filter(points, window.clamp(3, 5));
     let samples_per_segment = ((2.0 + factor * 6.0).round() as usize).max(2);
-    let interpolated = bezier_interpolate(&filtered, samples_per_segment);
+    let interpolated = catmull_rom_interpolate_impl(&filtered, samples_per_segment);
     snap_click_points(interpolated, points)
 }
 
@@ -61,77 +62,63 @@ pub fn simplify_with_click_anchors(points: &[CursorPoint], _epsilon: f64) -> Vec
 }
 
 /// Kept for compatibility with previous API.
-/// Internally switched from Catmull-Rom sampling to cubic Bezier interpolation.
+/// Uses Catmull-Rom sampling that passes through input control points.
 pub fn catmull_rom_interpolate(
     points: &[CursorPoint],
     samples_per_segment: usize,
 ) -> Vec<CursorPoint> {
-    bezier_interpolate(points, samples_per_segment)
+    catmull_rom_interpolate_impl(points, samples_per_segment)
 }
 
-fn adaptive_holt_filter(points: &[CursorPoint], smoothing_factor: f64) -> Vec<CursorPoint> {
-    let alpha_base = (0.72 - smoothing_factor * 0.58).clamp(0.08, 0.95);
-    let beta_base = (0.34 - smoothing_factor * 0.25).clamp(0.03, 0.9);
+fn simple_moving_average_filter(points: &[CursorPoint], window_size: usize) -> Vec<CursorPoint> {
+    if points.len() < 3 || window_size <= 1 {
+        return points.to_vec();
+    }
 
-    let mut output = Vec::with_capacity(points.len());
-    let first = points[0];
-    output.push(first);
+    let radius = window_size / 2;
+    let mut filtered = Vec::with_capacity(points.len());
 
-    let mut level_x = first.x;
-    let mut level_y = first.y;
-    let mut trend_x = 0.0;
-    let mut trend_y = 0.0;
-
-    for idx in 1..points.len() {
+    for idx in 0..points.len() {
         let point = points[idx];
-        let prev_input = points[idx - 1];
-
         if point.is_click {
-            level_x = point.x;
-            level_y = point.y;
-            trend_x = 0.0;
-            trend_y = 0.0;
-            output.push(point);
+            filtered.push(point);
             continue;
         }
 
-        let dt_ms = point.ts.saturating_sub(prev_input.ts).max(1) as f64;
-        let dt_scale = (dt_ms / 16.0).clamp(0.25, 4.0);
-        let speed = (point.x - prev_input.x).hypot(point.y - prev_input.y) / dt_ms;
-        let speed_boost = (speed / 3.0).clamp(0.0, 1.0);
+        let start = idx.saturating_sub(radius);
+        let end = (idx + radius + 1).min(points.len());
 
-        // Faster hand movement should reduce lag; slower movement should smooth more.
-        let alpha = (alpha_base + (1.0 - alpha_base) * speed_boost * 0.68).clamp(0.05, 0.98);
-        let beta = (beta_base + (1.0 - beta_base) * speed_boost * 0.42).clamp(0.02, 0.95);
+        let mut sum_x = 0.0;
+        let mut sum_y = 0.0;
+        let mut count = 0usize;
+        for sample in &points[start..end] {
+            sum_x += sample.x;
+            sum_y += sample.y;
+            count += 1;
+        }
 
-        let prev_level_x = level_x;
-        let prev_level_y = level_y;
-
-        let prediction_x = level_x + trend_x * dt_scale;
-        let prediction_y = level_y + trend_y * dt_scale;
-        level_x = alpha * point.x + (1.0 - alpha) * prediction_x;
-        level_y = alpha * point.y + (1.0 - alpha) * prediction_y;
-        trend_x = beta * (level_x - prev_level_x) + (1.0 - beta) * trend_x;
-        trend_y = beta * (level_y - prev_level_y) + (1.0 - beta) * trend_y;
-
-        output.push(CursorPoint {
+        filtered.push(CursorPoint {
             ts: point.ts,
-            x: level_x,
-            y: level_y,
+            x: sum_x / count as f64,
+            y: sum_y / count as f64,
             is_click: false,
         });
     }
 
-    output
+    filtered
 }
 
-fn bezier_interpolate(points: &[CursorPoint], samples_per_segment: usize) -> Vec<CursorPoint> {
+fn catmull_rom_interpolate_impl(
+    points: &[CursorPoint],
+    samples_per_segment: usize,
+) -> Vec<CursorPoint> {
     if points.len() < 2 {
         return points.to_vec();
     }
 
     let samples = samples_per_segment.max(2);
     let mut result = Vec::with_capacity((points.len() - 1) * samples + 1);
+    const ALPHA: f64 = 0.5;
 
     for idx in 0..(points.len() - 1) {
         let p0 = if idx == 0 {
@@ -147,35 +134,54 @@ fn bezier_interpolate(points: &[CursorPoint], samples_per_segment: usize) -> Vec
             points[idx + 1]
         };
 
-        let c1x = p1.x + (p2.x - p0.x) / 6.0;
-        let c1y = p1.y + (p2.y - p0.y) / 6.0;
-        let c2x = p2.x - (p3.x - p1.x) / 6.0;
-        let c2y = p2.y - (p3.y - p1.y) / 6.0;
+        let t0 = 0.0;
+        let t1 = next_knot(t0, p0, p1, ALPHA);
+        let t2 = next_knot(t1, p1, p2, ALPHA);
+        let t3 = next_knot(t2, p2, p3, ALPHA);
 
         for step in 0..=samples {
             if idx > 0 && step == 0 {
                 continue;
             }
 
-            let t = step as f64 / samples as f64;
-            let omt = 1.0 - t;
-            let x = omt.powi(3) * p1.x
-                + 3.0 * omt.powi(2) * t * c1x
-                + 3.0 * omt * t.powi(2) * c2x
-                + t.powi(3) * p2.x;
-            let y = omt.powi(3) * p1.y
-                + 3.0 * omt.powi(2) * t * c1y
-                + 3.0 * omt * t.powi(2) * c2y
-                + t.powi(3) * p2.y;
+            let ratio = step as f64 / samples as f64;
+            let t = t1 + (t2 - t1) * ratio;
 
-            let ts = lerp_ts(p1.ts, p2.ts, t);
+            let a1 = interpolate_point(p0, p1, t0, t1, t);
+            let a2 = interpolate_point(p1, p2, t1, t2, t);
+            let a3 = interpolate_point(p2, p3, t2, t3, t);
+            let b1 = interpolate_xy(a1, a2, t0, t2, t);
+            let b2 = interpolate_xy(a2, a3, t1, t3, t);
+            let c = interpolate_xy(b1, b2, t1, t2, t);
+
+            let ts = lerp_ts(p1.ts, p2.ts, ratio);
             let is_click = (step == 0 && p1.is_click) || (step == samples && p2.is_click);
 
-            result.push(CursorPoint { ts, x, y, is_click });
+            result.push(CursorPoint {
+                ts,
+                x: c.0,
+                y: c.1,
+                is_click,
+            });
         }
     }
 
     result
+}
+
+fn next_knot(current: f64, a: CursorPoint, b: CursorPoint, alpha: f64) -> f64 {
+    let distance = (b.x - a.x).hypot(b.y - a.y);
+    current + distance.max(0.0001).powf(alpha)
+}
+
+fn interpolate_point(a: CursorPoint, b: CursorPoint, t_a: f64, t_b: f64, t: f64) -> (f64, f64) {
+    interpolate_xy((a.x, a.y), (b.x, b.y), t_a, t_b, t)
+}
+
+fn interpolate_xy(a: (f64, f64), b: (f64, f64), t_a: f64, t_b: f64, t: f64) -> (f64, f64) {
+    let span = (t_b - t_a).abs().max(1e-6);
+    let r = ((t - t_a) / span).clamp(0.0, 1.0);
+    (a.0 + (b.0 - a.0) * r, a.1 + (b.1 - a.1) * r)
 }
 
 fn lerp_ts(start: u64, end: u64, t: f64) -> u64 {

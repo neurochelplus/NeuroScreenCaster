@@ -30,8 +30,6 @@ use windows_capture::{
 /// Target FPS for capture/output.
 pub const TARGET_FPS: u32 = 30;
 
-const HNS_PER_SECOND: i64 = 10_000_000;
-
 #[derive(Clone, Debug)]
 pub struct CaptureEncoderSettings {
     pub output_path: PathBuf,
@@ -49,33 +47,10 @@ pub struct CaptureFlags {
 pub struct ScreenRecorder {
     stop_flag: Arc<AtomicBool>,
     encoder: Option<VideoEncoder>,
-    frame_interval_hns: i64,
-    next_frame_deadline_hns: Option<i64>,
     encoded_frames: u64,
-    dropped_frames: u64,
 }
 
 impl ScreenRecorder {
-    fn should_encode_frame(&mut self, timestamp_hns: i64) -> bool {
-        if self.next_frame_deadline_hns.is_none() {
-            self.next_frame_deadline_hns =
-                Some(timestamp_hns.saturating_add(self.frame_interval_hns));
-            return true;
-        }
-
-        let deadline = self.next_frame_deadline_hns.unwrap_or(timestamp_hns);
-        if timestamp_hns.saturating_add(self.frame_interval_hns / 2) < deadline {
-            return false;
-        }
-
-        let mut next = deadline.saturating_add(self.frame_interval_hns);
-        while next <= timestamp_hns {
-            next = next.saturating_add(self.frame_interval_hns);
-        }
-        self.next_frame_deadline_hns = Some(next);
-        true
-    }
-
     fn finish_encoder(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(encoder) = self.encoder.take() {
             encoder
@@ -116,10 +91,7 @@ impl GraphicsCaptureApiHandler for ScreenRecorder {
         Ok(Self {
             stop_flag: flags.stop_flag,
             encoder: Some(encoder),
-            frame_interval_hns: (HNS_PER_SECOND / target_fps as i64).max(1),
-            next_frame_deadline_hns: None,
             encoded_frames: 0,
-            dropped_frames: 0,
         })
     }
 
@@ -130,12 +102,6 @@ impl GraphicsCaptureApiHandler for ScreenRecorder {
     ) -> Result<(), Self::Error> {
         if self.stop_flag.load(Ordering::Relaxed) {
             control.stop();
-            return Ok(());
-        }
-
-        let timestamp_hns = frame.timestamp().Duration;
-        if !self.should_encode_frame(timestamp_hns) {
-            self.dropped_frames = self.dropped_frames.saturating_add(1);
             return Ok(());
         }
 
@@ -152,11 +118,7 @@ impl GraphicsCaptureApiHandler for ScreenRecorder {
 
     fn on_closed(&mut self) -> Result<(), Self::Error> {
         self.finish_encoder()?;
-        log::info!(
-            "capture closed: encoded_frames={} dropped_frames={}",
-            self.encoded_frames,
-            self.dropped_frames
-        );
+        log::info!("capture closed: encoded_frames={}", self.encoded_frames);
         Ok(())
     }
 }

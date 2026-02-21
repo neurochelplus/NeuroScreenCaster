@@ -557,6 +557,7 @@ export default function EditScreen() {
   const playheadRef = useRef(0);
   const playheadStateRef = useRef(0);
   const lastStateSyncAtRef = useRef(0);
+  const playbackClockRef = useRef<{ anchorPerfMs: number; anchorPreviewMs: number } | null>(null);
 
   const timelineDurationMs = project?.durationMs ?? 0;
   const previewDurationMs = useMemo(() => {
@@ -669,10 +670,10 @@ export default function EditScreen() {
       const scale = 1 / Math.max(rect.width, rect.height);
       const centerX = rect.x + rect.width / 2;
       const centerY = rect.y + rect.height / 2;
+      const txPx = (0.5 - centerX * scale) * previewFrameSize.width;
+      const tyPx = (0.5 - centerY * scale) * previewFrameSize.height;
 
       if (previewCanvasRef.current) {
-        const txPx = (0.5 - centerX * scale) * previewFrameSize.width;
-        const tyPx = (0.5 - centerY * scale) * previewFrameSize.height;
         previewCanvasRef.current.style.transform = `translate3d(${txPx.toFixed(
           3
         )}px, ${tyPx.toFixed(3)}px, 0) scale(${scale.toFixed(6)})`;
@@ -680,8 +681,10 @@ export default function EditScreen() {
 
       if (cursorRef.current) {
         const cursor = interpolateCursor(cursorSamples, timelineMs);
-        const cursorX = cursor.x * previewFrameSize.width;
-        const cursorY = cursor.y * previewFrameSize.height;
+        const cursorVideoX = cursor.x * previewFrameSize.width;
+        const cursorVideoY = cursor.y * previewFrameSize.height;
+        const cursorX = cursorVideoX * scale + txPx;
+        const cursorY = cursorVideoY * scale + tyPx;
         cursorRef.current.style.transform = `translate3d(${cursorX.toFixed(
           3
         )}px, ${cursorY.toFixed(3)}px, 0) translate(-50%, -50%)`;
@@ -921,14 +924,39 @@ export default function EditScreen() {
       return;
     }
 
+    playbackClockRef.current = {
+      anchorPerfMs: performance.now(),
+      anchorPreviewMs: clamp(playheadRef.current, 0, previewDurationMs),
+    };
+
     const updateFromVideo = () => {
       const video = videoRef.current;
       if (!video || video.paused || video.ended) {
+        playbackClockRef.current = null;
         setIsVideoPlaying(false);
         return;
       }
 
-      const nextMs = clamp(Math.round(video.currentTime * 1000), 0, previewDurationMs);
+      const clock = playbackClockRef.current;
+      const playbackRate = Number.isFinite(video.playbackRate) ? video.playbackRate : 1;
+      let nextMs = clamp(Math.round(video.currentTime * 1000), 0, previewDurationMs);
+      if (clock) {
+        const predictedMs = clamp(
+          Math.round(clock.anchorPreviewMs + (performance.now() - clock.anchorPerfMs) * playbackRate),
+          0,
+          previewDurationMs
+        );
+        const decoderMs = clamp(Math.round(video.currentTime * 1000), 0, previewDurationMs);
+        if (Math.abs(decoderMs - predictedMs) > 70) {
+          playbackClockRef.current = {
+            anchorPerfMs: performance.now(),
+            anchorPreviewMs: decoderMs,
+          };
+          nextMs = decoderMs;
+        } else {
+          nextMs = predictedMs;
+        }
+      }
       renderPreviewFrame(nextMs);
 
       const now = performance.now();
@@ -947,6 +975,7 @@ export default function EditScreen() {
     rafRef.current = requestAnimationFrame(updateFromVideo);
 
     return () => {
+      playbackClockRef.current = null;
       if (rafRef.current !== null) {
         cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
@@ -1159,6 +1188,7 @@ export default function EditScreen() {
 
   const seekToPreviewMs = (nextMs: number) => {
     const clampedMs = clamp(nextMs, 0, previewDurationMs);
+    playbackClockRef.current = null;
     playheadRef.current = clampedMs;
     setPlayheadMs(clampedMs);
     renderPreviewFrame(clampedMs);
@@ -1180,6 +1210,10 @@ export default function EditScreen() {
     if (video.paused || video.ended) {
       try {
         await video.play();
+        playbackClockRef.current = {
+          anchorPerfMs: performance.now(),
+          anchorPreviewMs: clamp(playheadRef.current, 0, previewDurationMs),
+        };
         setIsVideoPlaying(true);
       } catch (err) {
         setVideoError(`Failed to play video: ${String(err)}`);
@@ -1188,6 +1222,7 @@ export default function EditScreen() {
     }
 
     video.pause();
+    playbackClockRef.current = null;
     setIsVideoPlaying(false);
   };
 
@@ -1425,9 +1460,25 @@ export default function EditScreen() {
                         className="preview-video"
                         src={videoSrc}
                         preload="metadata"
-                        onPlay={() => setIsVideoPlaying(true)}
-                        onPause={() => setIsVideoPlaying(false)}
-                        onEnded={() => setIsVideoPlaying(false)}
+                        onPlay={(event) => {
+                          playbackClockRef.current = {
+                            anchorPerfMs: performance.now(),
+                            anchorPreviewMs: clamp(
+                              Math.round(event.currentTarget.currentTime * 1000),
+                              0,
+                              previewDurationMs
+                            ),
+                          };
+                          setIsVideoPlaying(true);
+                        }}
+                        onPause={() => {
+                          playbackClockRef.current = null;
+                          setIsVideoPlaying(false);
+                        }}
+                        onEnded={() => {
+                          playbackClockRef.current = null;
+                          setIsVideoPlaying(false);
+                        }}
                         onLoadedMetadata={(event) => {
                           const durationSec = event.currentTarget.duration;
                           if (Number.isFinite(durationSec) && durationSec > 0) {
@@ -1472,16 +1523,16 @@ export default function EditScreen() {
                     )}
 
                     <div className="preview-overlay-grid" />
-                    <div
-                      ref={cursorRef}
-                      className="preview-cursor"
-                      style={{
-                        width: `${project.settings.cursor.size * 16}px`,
-                        height: `${project.settings.cursor.size * 16}px`,
-                        background: project.settings.cursor.color,
-                      }}
-                    />
                   </div>
+                  <div
+                    ref={cursorRef}
+                    className="preview-cursor"
+                    style={{
+                      width: `${project.settings.cursor.size * 16}px`,
+                      height: `${project.settings.cursor.size * 16}px`,
+                      background: project.settings.cursor.color,
+                    }}
+                  />
                 </div>
               </div>
 

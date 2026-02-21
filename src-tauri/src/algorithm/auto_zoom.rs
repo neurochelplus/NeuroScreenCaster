@@ -24,11 +24,7 @@ pub struct AutoZoomConfig {
     pub max_ui_rect_area_ratio: f64,
     pub missing_control_max_area_ratio: f64,
     pub missing_control_max_side_ratio: f64,
-    pub focus_sample_ms: u64,
-    pub focus_base_follow: f64,
-    pub focus_energy_follow: f64,
-    pub focus_energy_rise: f64,
-    pub focus_energy_decay_per_ms: f64,
+    pub scroll_target_step_ratio: f64,
     pub segment_stitch_gap_ms: u64,
     pub spring_mass: f64,
     pub spring_stiffness: f64,
@@ -59,11 +55,7 @@ impl Default for AutoZoomConfig {
             max_ui_rect_area_ratio: 0.45,
             missing_control_max_area_ratio: 0.25,
             missing_control_max_side_ratio: 0.72,
-            focus_sample_ms: 75,
-            focus_base_follow: 0.08,
-            focus_energy_follow: 0.34,
-            focus_energy_rise: 0.40,
-            focus_energy_decay_per_ms: 0.0015,
+            scroll_target_step_ratio: 0.10,
             segment_stitch_gap_ms: 900,
             spring_mass: 1.0,
             spring_stiffness: 170.0,
@@ -462,15 +454,8 @@ pub fn build_auto_zoom_segments_with_context_and_config(
             continue;
         }
 
-        let target_points = build_target_points(
-            start_ts,
-            end_ts,
-            &pointer_samples,
-            &scroll_samples,
-            &initial_rect,
-            metrics,
-            config,
-        );
+        let target_points =
+            build_target_points(start_ts, end_ts, &scroll_samples, &initial_rect, config);
 
         segments.push(ZoomSegment {
             id: format!("auto-{}", segments.len() + 1),
@@ -841,21 +826,12 @@ fn dynamic_lookahead_ms(config: &AutoZoomConfig, velocity_px_per_ms: f64) -> u64
 #[derive(Debug, Clone, Copy)]
 enum TargetEvent {
     Scroll { ts: u64, dx: f64, dy: f64 },
-    Pointer { ts: u64, x: f64, y: f64 },
 }
 
 impl TargetEvent {
     fn ts(self) -> u64 {
         match self {
             TargetEvent::Scroll { ts, .. } => ts,
-            TargetEvent::Pointer { ts, .. } => ts,
-        }
-    }
-
-    fn order(self) -> u8 {
-        match self {
-            TargetEvent::Scroll { .. } => 0,
-            TargetEvent::Pointer { .. } => 1,
         }
     }
 }
@@ -863,10 +839,8 @@ impl TargetEvent {
 fn build_target_points(
     start_ts: u64,
     end_ts: u64,
-    pointers: &[PointerSample],
     scrolls: &[ScrollSample],
     initial_rect: &NormalizedRect,
-    metrics: ScreenMetrics,
     config: &AutoZoomConfig,
 ) -> Vec<TargetPoint> {
     if start_ts >= end_ts {
@@ -894,89 +868,29 @@ fn build_target_points(
             dy: scroll.dy,
         });
     }
-
-    let mut last_pointer_ts: Option<u64> = None;
-    for pointer in pointers {
-        if pointer.ts < start_ts || pointer.ts > end_ts {
-            continue;
-        }
-        if let Some(last_ts) = last_pointer_ts {
-            if pointer.ts.saturating_sub(last_ts) < config.focus_sample_ms {
-                continue;
-            }
-        }
-        last_pointer_ts = Some(pointer.ts);
-        events.push(TargetEvent::Pointer {
-            ts: pointer.ts,
-            x: pointer.x,
-            y: pointer.y,
-        });
-    }
-
-    events.sort_by(|left, right| {
-        left.ts()
-            .cmp(&right.ts())
-            .then(left.order().cmp(&right.order()))
-    });
-
-    let mut focus_x = base_rect.x + base_rect.width / 2.0;
-    let mut focus_y = base_rect.y + base_rect.height / 2.0;
-    let mut desired_x = focus_x;
-    let mut desired_y = focus_y;
-    let mut energy = 0.0f64;
-    let mut last_ts = start_ts;
+    events.sort_by_key(|event| event.ts());
 
     for event in events {
-        let ts = event.ts();
-        let dt_ms = ts.saturating_sub(last_ts);
-        energy = decay_energy(energy, dt_ms, config.focus_energy_decay_per_ms);
-
         match event {
-            TargetEvent::Scroll { dx, dy, .. } => {
+            TargetEvent::Scroll { ts, dx, dy } => {
                 let normalized_dx = normalize_scroll_delta(dx);
                 let normalized_dy = normalize_scroll_delta(dy);
-                desired_x = (desired_x + normalized_dx * base_rect.width * 0.08).clamp(0.0, 1.0);
-                desired_y = (desired_y - normalized_dy * base_rect.height * 0.12).clamp(0.0, 1.0);
+                let shift_x =
+                    normalized_dx * base_rect.width * config.scroll_target_step_ratio.max(0.0);
+                let shift_y =
+                    -normalized_dy * base_rect.height * config.scroll_target_step_ratio.max(0.0);
+                base_rect = shift_target_rect(&base_rect, shift_x, shift_y);
 
-                let scroll_boost = (normalized_dx.abs() + normalized_dy.abs()) * 0.05;
-                energy =
-                    (energy + config.focus_energy_rise * (0.35 + scroll_boost)).clamp(0.0, 1.0);
-            }
-            TargetEvent::Pointer { x, y, .. } => {
-                let cursor_x = (x / metrics.width).clamp(0.0, 1.0);
-                let cursor_y = (y / metrics.height).clamp(0.0, 1.0);
-                let jump = (cursor_x - desired_x).hypot(cursor_y - desired_y);
-                desired_x = cursor_x;
-                desired_y = cursor_y;
-
-                let pointer_boost = (0.5 + jump).clamp(0.1, 1.6);
-                energy = (energy + config.focus_energy_rise * pointer_boost).clamp(0.0, 1.0);
+                push_target_point(
+                    &mut target_points,
+                    TargetPoint {
+                        ts,
+                        rect: base_rect.clone(),
+                    },
+                );
             }
         }
-
-        let follow =
-            (config.focus_base_follow + config.focus_energy_follow * energy).clamp(0.01, 0.98);
-        focus_x += (desired_x - focus_x) * follow;
-        focus_y += (desired_y - focus_y) * follow;
-        base_rect = recenter_target_rect(&base_rect, focus_x, focus_y);
-
-        push_target_point(
-            &mut target_points,
-            TargetPoint {
-                ts,
-                rect: base_rect.clone(),
-            },
-        );
-        last_ts = ts;
     }
-
-    let tail_dt_ms = end_ts.saturating_sub(last_ts);
-    energy = decay_energy(energy, tail_dt_ms, config.focus_energy_decay_per_ms);
-    let settle_follow =
-        (config.focus_base_follow + config.focus_energy_follow * energy).clamp(0.01, 0.98);
-    focus_x += (desired_x - focus_x) * settle_follow;
-    focus_y += (desired_y - focus_y) * settle_follow;
-    base_rect = recenter_target_rect(&base_rect, focus_x, focus_y);
 
     push_target_point(
         &mut target_points,
@@ -989,24 +903,10 @@ fn build_target_points(
     target_points
 }
 
-fn decay_energy(current: f64, dt_ms: u64, decay_per_ms: f64) -> f64 {
-    if dt_ms == 0 {
-        return current.clamp(0.0, 1.0);
-    }
-
-    let safe_decay = if decay_per_ms.is_finite() {
-        decay_per_ms.clamp(0.00001, 0.1)
-    } else {
-        0.0015
-    };
-    let decay = (-(safe_decay * dt_ms as f64)).exp();
-    (current * decay).clamp(0.0, 1.0)
-}
-
-fn recenter_target_rect(base: &NormalizedRect, center_x: f64, center_y: f64) -> NormalizedRect {
+fn shift_target_rect(base: &NormalizedRect, shift_x: f64, shift_y: f64) -> NormalizedRect {
     normalize_target_rect(NormalizedRect {
-        x: center_x - base.width / 2.0,
-        y: center_y - base.height / 2.0,
+        x: base.x + shift_x,
+        y: base.y + shift_y,
         width: base.width,
         height: base.height,
     })
@@ -1254,6 +1154,32 @@ mod tests {
             .last()
             .expect("target points must have last point");
         assert!(last.rect.y > first.rect.y);
+    }
+
+    #[test]
+    fn pointer_motion_does_not_create_target_points_without_scroll() {
+        let events = vec![
+            click(1_000, 400.0, 300.0, None, None),
+            InputEvent::Move {
+                ts: 1_150,
+                x: 500.0,
+                y: 350.0,
+            },
+            InputEvent::Move {
+                ts: 1_350,
+                x: 900.0,
+                y: 650.0,
+            },
+            InputEvent::Move {
+                ts: 1_600,
+                x: 1_400.0,
+                y: 900.0,
+            },
+        ];
+
+        let segments = build_auto_zoom_segments(&events, 1_920, 1_080, 4_000);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].target_points.len(), 1);
     }
 
     #[test]
