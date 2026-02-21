@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::algorithm::{auto_zoom, cursor_smoothing};
+use crate::algorithm::{camera_engine, cursor_smoothing};
 use crate::capture::recorder::{
     find_ffmpeg_exe, get_monitor_scale_factor, get_monitor_size, start_capture,
 };
@@ -153,13 +153,14 @@ fn save_recording_files(
 ) -> Result<(), String> {
     let settings = ProjectSettings::default();
     let output_aspect_ratio = settings.export.width as f64 / settings.export.height.max(1) as f64;
-    let zoom_segments = auto_zoom::build_auto_zoom_segments_with_context(
+    let camera_config = camera_engine::SmartCameraConfig::default();
+    let zoom_segments = camera_engine::build_smart_camera_segments(
         &events,
         width,
         height,
-        scale_factor,
         duration_ms,
         output_aspect_ratio,
+        &camera_config,
     );
     let smoothed_cursor_path =
         cursor_smoothing::smooth_cursor_path(&events, settings.cursor.smoothing_factor);

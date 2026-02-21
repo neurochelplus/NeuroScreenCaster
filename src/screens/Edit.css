@@ -223,6 +223,15 @@
   accent-color: var(--brand);
 }
 
+.sidebar-controls select {
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--panel-text);
+  padding: 7px 9px;
+  font: inherit;
+}
+
 .editor-preview-column {
   padding: 14px;
   display: grid;

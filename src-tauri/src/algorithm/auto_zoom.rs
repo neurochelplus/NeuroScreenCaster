@@ -1,5 +1,7 @@
 use crate::models::events::{BoundingRect, InputEvent, UiContext};
-use crate::models::project::{CameraSpring, NormalizedRect, TargetPoint, ZoomSegment};
+use crate::models::project::{
+    CameraSpring, NormalizedRect, TargetPoint, ZoomMode, ZoomSegment, ZoomTrigger,
+};
 
 #[derive(Debug, Clone)]
 pub struct AutoZoomConfig {
@@ -470,6 +472,8 @@ pub fn build_auto_zoom_segments_with_context_and_config(
             },
             pan_trajectory: Vec::new(),
             legacy_easing: None,
+            mode: ZoomMode::Fixed,
+            trigger: ZoomTrigger::AutoClick,
             is_auto: true,
         });
 

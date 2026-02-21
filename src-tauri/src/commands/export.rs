@@ -1441,7 +1441,7 @@ mod tests {
     use super::*;
     use crate::models::project::{
         Background, CameraSpring, CursorSettings, ExportSettings, NormalizedRect, ProjectSettings,
-        Timeline, ZoomSegment,
+        Timeline, ZoomMode, ZoomSegment, ZoomTrigger,
     };
 
     fn sample_project() -> Project {
@@ -1475,6 +1475,8 @@ mod tests {
                     },
                     pan_trajectory: vec![],
                     legacy_easing: None,
+                    mode: ZoomMode::Fixed,
+                    trigger: ZoomTrigger::AutoClick,
                     is_auto: true,
                 }],
             },
@@ -1500,6 +1502,8 @@ mod tests {
             },
             pan_trajectory: vec![],
             legacy_easing: None,
+            mode: ZoomMode::Fixed,
+            trigger: ZoomTrigger::AutoClick,
             is_auto: true,
         }
     }

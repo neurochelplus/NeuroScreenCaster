@@ -8,7 +8,9 @@ import type {
   PanKeyframe,
   Project,
   TargetPoint,
+  ZoomMode,
   ZoomSegment,
+  ZoomTrigger,
 } from "../types/project";
 import "./Edit.css";
 
@@ -54,6 +56,8 @@ interface RuntimeSegment {
   startTs: number;
   endTs: number;
   isAuto: boolean;
+  mode: ZoomMode;
+  trigger: ZoomTrigger;
   baseRect: NormalizedRect;
   targetPoints: TargetPoint[];
   spring: CameraSpring;
@@ -67,10 +71,16 @@ interface SpringCameraSample {
 const DEFAULT_RECT: NormalizedRect = { x: 0.2, y: 0.2, width: 0.6, height: 0.6 };
 const FULL_RECT: NormalizedRect = { x: 0, y: 0, width: 1, height: 1 };
 const DEFAULT_SPRING: CameraSpring = { mass: 1, stiffness: 170, damping: 26 };
+const DEFAULT_SEGMENT_MODE: ZoomMode = "fixed";
+const DEFAULT_SEGMENT_TRIGGER: ZoomTrigger = "manual";
 const MIN_RECT_SIZE = 0.05;
 const MIN_SEGMENT_MS = 200;
 const PLAYHEAD_STATE_SYNC_INTERVAL_MS = 120;
 const PREVIEW_SPRING_FPS = 60;
+const FOLLOW_SAMPLE_STEP_MS = 75;
+const FOLLOW_DEAD_ZONE_RATIO = 0.25;
+const FOLLOW_HARD_EDGE_RATIO = 0.45;
+const FOLLOW_MAX_SPEED_PX_PER_S = 800;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -82,6 +92,25 @@ function normalizeRect(rect: NormalizedRect): NormalizedRect {
   const x = clamp(rect.x, 0, 1 - width);
   const y = clamp(rect.y, 0, 1 - height);
   return { x, y, width, height };
+}
+
+function normalizeSegmentMode(mode: ZoomMode | undefined): ZoomMode {
+  return mode === "follow-cursor" ? "follow-cursor" : DEFAULT_SEGMENT_MODE;
+}
+
+function normalizeSegmentTrigger(trigger: ZoomTrigger | undefined, isAuto: boolean): ZoomTrigger {
+  if (trigger === "auto-click" || trigger === "auto-scroll" || trigger === "manual") {
+    return trigger;
+  }
+  return isAuto ? "auto-click" : DEFAULT_SEGMENT_TRIGGER;
+}
+
+function normalizeZoomSegment(segment: ZoomSegment): ZoomSegment {
+  return {
+    ...segment,
+    mode: normalizeSegmentMode(segment.mode),
+    trigger: normalizeSegmentTrigger(segment.trigger, segment.isAuto),
+  };
 }
 
 function getSegmentBaseRect(segment: ZoomSegment): NormalizedRect {
@@ -223,18 +252,33 @@ function getTargetRectAtTs(segment: RuntimeSegment, timelineTs: number): Normali
   return segment.targetPoints[0].rect;
 }
 
-function toRuntimeSegments(segments: ZoomSegment[]): RuntimeSegment[] {
+function toRuntimeSegments(
+  segments: ZoomSegment[],
+  cursorSamples: CursorSample[],
+  sourceWidth: number,
+  sourceHeight: number
+): RuntimeSegment[] {
   return [...segments]
     .sort((a, b) => a.startTs - b.startTs)
-    .map((segment) => ({
-      id: segment.id,
-      startTs: segment.startTs,
-      endTs: segment.endTs,
-      isAuto: segment.isAuto,
-      baseRect: getSegmentBaseRect(segment),
-      targetPoints: getSegmentTargetPoints(segment),
-      spring: normalizeSpring(segment.spring),
-    }));
+    .map((rawSegment) => {
+      const segment = normalizeZoomSegment(rawSegment);
+      const baseRect = getSegmentBaseRect(segment);
+      const targetPoints =
+        segment.mode === "follow-cursor"
+          ? buildFollowCursorTargetPoints(segment, baseRect, cursorSamples, sourceWidth, sourceHeight)
+          : getSegmentTargetPoints(segment);
+      return {
+        id: segment.id,
+        startTs: segment.startTs,
+        endTs: segment.endTs,
+        isAuto: segment.isAuto,
+        mode: normalizeSegmentMode(segment.mode),
+        trigger: normalizeSegmentTrigger(segment.trigger, segment.isAuto),
+        baseRect,
+        targetPoints,
+        spring: normalizeSpring(segment.spring),
+      };
+    });
 }
 
 function resolveRuntimeSegment(segments: RuntimeSegment[], timelineTs: number): RuntimeSegment | null {
@@ -364,7 +408,7 @@ function updateSegmentBaseRect(segment: ZoomSegment, rect: NormalizedRect): Zoom
 }
 
 function sortSegments(segments: ZoomSegment[]): ZoomSegment[] {
-  return [...segments].sort((a, b) => a.startTs - b.startTs);
+  return [...segments].map(normalizeZoomSegment).sort((a, b) => a.startTs - b.startTs);
 }
 
 function formatMs(ms: number): string {
@@ -513,6 +557,112 @@ function buildRectFromCenterZoom(
   });
 }
 
+function clampCenterToViewport(
+  centerX: number,
+  centerY: number,
+  viewportWidth: number,
+  viewportHeight: number
+): { x: number; y: number } {
+  const halfW = clamp(viewportWidth / 2, 0, 0.5);
+  const halfH = clamp(viewportHeight / 2, 0, 0.5);
+  return {
+    x: clamp(centerX, halfW, 1 - halfW),
+    y: clamp(centerY, halfH, 1 - halfH),
+  };
+}
+
+function buildRectFromCenterAndSize(
+  centerX: number,
+  centerY: number,
+  width: number,
+  height: number
+): NormalizedRect {
+  const safeWidth = clamp(width, MIN_RECT_SIZE, 1);
+  const safeHeight = clamp(height, MIN_RECT_SIZE, 1);
+  const clamped = clampCenterToViewport(centerX, centerY, safeWidth, safeHeight);
+  return normalizeRect({
+    x: clamped.x - safeWidth / 2,
+    y: clamped.y - safeHeight / 2,
+    width: safeWidth,
+    height: safeHeight,
+  });
+}
+
+function buildFollowCursorTargetPoints(
+  segment: ZoomSegment,
+  baseRect: NormalizedRect,
+  cursorSamples: CursorSample[],
+  sourceWidth: number,
+  sourceHeight: number
+): TargetPoint[] {
+  const startTs = segment.startTs;
+  const endTs = segment.endTs;
+  if (endTs <= startTs) {
+    return [
+      { ts: startTs, rect: baseRect },
+      { ts: startTs + 1, rect: baseRect },
+    ];
+  }
+
+  if (cursorSamples.length === 0) {
+    return [
+      { ts: startTs, rect: baseRect },
+      { ts: endTs, rect: baseRect },
+    ];
+  }
+
+  const safeWidthPx = Math.max(1, sourceWidth);
+  const safeHeightPx = Math.max(1, sourceHeight);
+  const stepMs = Math.max(FOLLOW_SAMPLE_STEP_MS, 1);
+  const deadRatio = FOLLOW_DEAD_ZONE_RATIO;
+  const hardRatio = FOLLOW_HARD_EDGE_RATIO;
+  const maxSpeedX = FOLLOW_MAX_SPEED_PX_PER_S / safeWidthPx;
+  const maxSpeedY = FOLLOW_MAX_SPEED_PX_PER_S / safeHeightPx;
+
+  let centerX = baseRect.x + baseRect.width / 2;
+  let centerY = baseRect.y + baseRect.height / 2;
+  const points: TargetPoint[] = [];
+  let ts = startTs;
+  let lastTs = startTs;
+
+  while (ts <= endTs) {
+    const dtSec = Math.max(0, ts - lastTs) / 1000;
+    lastTs = ts;
+    const cursor = interpolateCursor(cursorSamples, ts);
+    const offsetX = cursor.x - centerX;
+    const offsetY = cursor.y - centerY;
+    const deadX = baseRect.width * deadRatio;
+    const deadY = baseRect.height * deadRatio;
+    const hardX = baseRect.width * hardRatio;
+    const hardY = baseRect.height * hardRatio;
+
+    if (Math.abs(offsetX) > deadX) {
+      const excess = Math.abs(offsetX) - deadX;
+      const range = Math.max(hardX - deadX, 0.0001);
+      const speedFactor = clamp(excess / range, 0, 1);
+      centerX += Math.sign(offsetX) * speedFactor * maxSpeedX * dtSec;
+    }
+    if (Math.abs(offsetY) > deadY) {
+      const excess = Math.abs(offsetY) - deadY;
+      const range = Math.max(hardY - deadY, 0.0001);
+      const speedFactor = clamp(excess / range, 0, 1);
+      centerY += Math.sign(offsetY) * speedFactor * maxSpeedY * dtSec;
+    }
+
+    const rect = buildRectFromCenterAndSize(centerX, centerY, baseRect.width, baseRect.height);
+    centerX = rect.x + rect.width / 2;
+    centerY = rect.y + rect.height / 2;
+    points.push({ ts, rect });
+    ts += stepMs;
+  }
+
+  if (points[points.length - 1].ts !== endTs) {
+    const lastRect = points[points.length - 1].rect;
+    points.push({ ts: endTs, rect: lastRect });
+  }
+  return points;
+}
+
 function chooseMarkerStepMs(pxPerMs: number): number {
   const targetSpacingPx = 90;
   const approxStepMs = targetSpacingPx / Math.max(pxPerMs, 0.0001);
@@ -611,7 +761,20 @@ export default function EditScreen() {
     () => sortSegments(project?.timeline.zoomSegments ?? []),
     [project?.timeline.zoomSegments]
   );
-  const runtimeSegments = useMemo(() => toRuntimeSegments(timelineSegments), [timelineSegments]);
+  const cursorSamples = useMemo(
+    () => extractCursorSamples(eventsFile, project?.settings.cursor.smoothingFactor ?? 0.8),
+    [eventsFile, project?.settings.cursor.smoothingFactor]
+  );
+  const runtimeSegments = useMemo(
+    () =>
+      toRuntimeSegments(
+        timelineSegments,
+        cursorSamples,
+        project?.videoWidth ?? 1920,
+        project?.videoHeight ?? 1080
+      ),
+    [timelineSegments, cursorSamples, project?.videoHeight, project?.videoWidth]
+  );
 
   const selectedSegment = useMemo(() => {
     if (!project || !selectedSegmentId) {
@@ -650,11 +813,6 @@ export default function EditScreen() {
   const previewCameraTrack = useMemo(
     () => buildSpringCameraTrack(runtimeSegments, timelineDurationMs),
     [runtimeSegments, timelineDurationMs]
-  );
-
-  const cursorSamples = useMemo(
-    () => extractCursorSamples(eventsFile, project?.settings.cursor.smoothingFactor ?? 0.8),
-    [eventsFile, project?.settings.cursor.smoothingFactor]
   );
 
   const renderPreviewFrame = useCallback(
@@ -1111,10 +1269,35 @@ export default function EditScreen() {
     setInfo(null);
     setIsSaving(true);
     try {
+      const runtimeById = new Map(runtimeSegments.map((segment) => [segment.id, segment]));
+      const projectForSave: Project = {
+        ...project,
+        timeline: {
+          ...project.timeline,
+          zoomSegments: sortSegments(
+            project.timeline.zoomSegments.map((rawSegment) => {
+              const segment = normalizeZoomSegment(rawSegment);
+              if (segment.mode !== "follow-cursor") {
+                return segment;
+              }
+              const runtime = runtimeById.get(segment.id);
+              if (!runtime) {
+                return segment;
+              }
+              return {
+                ...segment,
+                targetPoints: runtime.targetPoints,
+              };
+            })
+          ),
+        },
+      };
+
       const savedPath = await invoke<string>("save_project", {
-        project,
+        project: projectForSave,
         projectPath: loadedProjectPath,
       });
+      setProject(projectForSave);
       setLoadedProjectPath(savedPath);
       await refreshProjects(false);
       setInfo(`Project saved: ${savedPath}`);
@@ -1148,6 +1331,8 @@ export default function EditScreen() {
       targetPoints: [],
       spring: { ...DEFAULT_SPRING },
       panTrajectory: [],
+      mode: "fixed",
+      trigger: "manual",
       isAuto: false,
     };
 
@@ -1340,6 +1525,25 @@ export default function EditScreen() {
                     <span>{selectedSegment.id}</span>
                     <span>{selectedSegment.isAuto ? "auto" : "manual"}</span>
                   </div>
+
+                  <label>
+                    <span>Camera Mode</span>
+                    <select
+                      value={normalizeSegmentMode(selectedSegment.mode)}
+                      onChange={(event) =>
+                        updateSegment(selectedSegment.id, (segment) => ({
+                          ...normalizeZoomSegment(segment),
+                          mode: event.target.value as ZoomMode,
+                          targetPoints:
+                            event.target.value === "fixed" ? [] : segment.targetPoints ?? [],
+                          isAuto: false,
+                        }))
+                      }
+                    >
+                      <option value="fixed">Locked</option>
+                      <option value="follow-cursor">Follow cursor</option>
+                    </select>
+                  </label>
 
                   <label>
                     <span>Zoom Strength</span>
@@ -1610,6 +1814,8 @@ export default function EditScreen() {
                         }
                         const isSelected = selectedSegmentId === visual.id;
                         const zoom = getZoomStrength(getSegmentBaseRect(segment));
+                        const modeLabel =
+                          normalizeSegmentMode(segment.mode) === "follow-cursor" ? "Follow" : "Locked";
 
                         return (
                           <div
@@ -1631,7 +1837,9 @@ export default function EditScreen() {
                               className="timeline-segment-handle timeline-segment-handle--start"
                               onPointerDown={(event) => startDragSegment(event, segment, "start")}
                             />
-                            <span>{visual.isAuto ? "A" : "M"} Zoom {zoom.toFixed(1)}x</span>
+                            <span>
+                              {visual.isAuto ? "A" : "M"} {modeLabel} {zoom.toFixed(1)}x
+                            </span>
                             <div
                               className="timeline-segment-handle timeline-segment-handle--end"
                               onPointerDown={(event) => startDragSegment(event, segment, "end")}

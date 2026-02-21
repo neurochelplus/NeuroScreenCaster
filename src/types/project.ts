@@ -34,6 +34,9 @@ export interface CameraSpring {
   damping: number;
 }
 
+export type ZoomMode = "fixed" | "follow-cursor";
+export type ZoomTrigger = "auto-click" | "auto-scroll" | "manual";
+
 export interface ZoomSegment {
   id: string;
   /** Начало сегмента (мс от начала записи). */
@@ -46,6 +49,8 @@ export interface ZoomSegment {
   targetPoints?: TargetPoint[];
   spring?: CameraSpring;
   panTrajectory?: PanKeyframe[];
+  mode?: ZoomMode;
+  trigger?: ZoomTrigger;
   /** true — создан алгоритмом авто-зума; false — пользователем вручную. */
   isAuto: boolean;
 }

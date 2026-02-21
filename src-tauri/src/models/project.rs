@@ -57,6 +57,33 @@ impl Default for CameraSpring {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ZoomMode {
+    Fixed,
+    FollowCursor,
+}
+
+impl Default for ZoomMode {
+    fn default() -> Self {
+        Self::Fixed
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ZoomTrigger {
+    AutoClick,
+    AutoScroll,
+    Manual,
+}
+
+impl Default for ZoomTrigger {
+    fn default() -> Self {
+        Self::Manual
+    }
+}
+
 /// Один зум-сегмент на таймлайне.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +106,10 @@ pub struct ZoomSegment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(alias = "easing")]
     pub legacy_easing: Option<String>,
+    #[serde(default)]
+    pub mode: ZoomMode,
+    #[serde(default)]
+    pub trigger: ZoomTrigger,
     /// true — создан алгоритмом, false — пользователем вручную.
     #[serde(default)]
     pub is_auto: bool,
