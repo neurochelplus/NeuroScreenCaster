@@ -1,0 +1,132 @@
+.record-screen {
+  max-width: 640px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.record-header h1 {
+  font-size: 22px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.record-subtitle {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.record-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+}
+
+.record-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.record-status--active {
+  color: var(--text-primary);
+}
+
+.record-indicator {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--border);
+}
+
+.record-status--active .record-indicator {
+  background: var(--danger);
+  box-shadow: 0 0 0 0 rgba(232, 64, 64, 0.4);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(232, 64, 64, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(232, 64, 64, 0); }
+}
+
+.record-btn {
+  font-size: 15px;
+  padding: 12px 36px;
+  font-weight: 600;
+}
+
+.record-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.record-meta-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-secondary);
+}
+
+.record-meta-value {
+  font-family: "Consolas", monospace;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  padding: 4px 10px;
+  border-radius: 4px;
+}
+
+.record-error {
+  color: var(--danger);
+  font-size: 13px;
+  background: rgba(232, 64, 64, 0.1);
+  border: 1px solid rgba(232, 64, 64, 0.3);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  width: 100%;
+}
+
+.record-info {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.record-info-item {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.info-icon {
+  font-size: 20px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.record-info-item strong {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.record-info-item p {
+  font-size: 12px;
+  color: var(--text-secondary);
+}

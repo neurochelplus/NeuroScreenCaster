@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "project.schema.json",
+  "title": "Project",
+  "description": "NeuroScreenCaster project — schemaVersion 1",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "id",
+    "name",
+    "createdAt",
+    "videoPath",
+    "eventsPath",
+    "durationMs",
+    "videoWidth",
+    "videoHeight",
+    "timeline",
+    "settings"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "createdAt": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms)"
+    },
+    "videoPath": { "type": "string" },
+    "eventsPath": { "type": "string" },
+    "durationMs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "videoWidth": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "videoHeight": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "timeline": { "$ref": "#/$defs/Timeline" },
+    "settings": { "$ref": "#/$defs/ProjectSettings" }
+  },
+  "$defs": {
+    "NormalizedRect": {
+      "type": "object",
+      "required": ["x", "y", "width", "height"],
+      "additionalProperties": false,
+      "properties": {
+        "x": { "type": "number", "minimum": 0, "maximum": 1 },
+        "y": { "type": "number", "minimum": 0, "maximum": 1 },
+        "width": { "type": "number", "minimum": 0, "maximum": 1 },
+        "height": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "ZoomEasing": {
+      "type": "string",
+      "enum": ["linear", "ease-in", "ease-out", "ease-in-out"]
+    },
+    "ZoomSegment": {
+      "type": "object",
+      "required": ["id", "startTs", "endTs", "targetRect", "easing", "isAuto"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "startTs": { "type": "integer", "minimum": 0 },
+        "endTs": { "type": "integer", "minimum": 0 },
+        "targetRect": { "$ref": "#/$defs/NormalizedRect" },
+        "easing": { "$ref": "#/$defs/ZoomEasing" },
+        "isAuto": { "type": "boolean" }
+      }
+    },
+    "Timeline": {
+      "type": "object",
+      "required": ["zoomSegments"],
+      "additionalProperties": false,
+      "properties": {
+        "zoomSegments": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ZoomSegment" }
+        }
+      }
+    },
+    "CursorSettings": {
+      "type": "object",
+      "required": ["size", "color", "smoothingFactor"],
+      "additionalProperties": false,
+      "properties": {
+        "size": { "type": "number", "minimum": 0.1, "maximum": 5.0 },
+        "color": { "type": "string" },
+        "smoothingFactor": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+      }
+    },
+    "Background": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "color"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "solid" },
+            "color": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "from", "to", "direction"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "gradient" },
+            "from": { "type": "string" },
+            "to": { "type": "string" },
+            "direction": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "ExportSettings": {
+      "type": "object",
+      "required": ["width", "height", "fps", "codec"],
+      "additionalProperties": false,
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "fps": { "type": "integer", "minimum": 1, "maximum": 120 },
+        "codec": { "type": "string", "enum": ["h264", "h265", "vp9"] }
+      }
+    },
+    "ProjectSettings": {
+      "type": "object",
+      "required": ["cursor", "background", "export"],
+      "additionalProperties": false,
+      "properties": {
+        "cursor": { "$ref": "#/$defs/CursorSettings" },
+        "background": { "$ref": "#/$defs/Background" },
+        "export": { "$ref": "#/$defs/ExportSettings" }
+      }
+    }
+  }
+}

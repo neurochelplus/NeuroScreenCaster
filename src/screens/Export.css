@@ -1,0 +1,151 @@
+.export-screen {
+  max-width: 980px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.export-header h1 {
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.export-subtitle {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.export-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.export-card h2 {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.export-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.export-field {
+  display: grid;
+  gap: 6px;
+}
+
+.export-field span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.export-field input,
+.export-field select {
+  border: 1px solid var(--border);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: inherit;
+}
+
+.export-field input:focus,
+.export-field select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.export-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.export-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.export-status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.export-status-label {
+  color: var(--text-primary);
+}
+
+.export-status-value {
+  color: var(--text-secondary);
+  font-family: Consolas, monospace;
+}
+
+.export-progress {
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-tertiary);
+  overflow: hidden;
+}
+
+.export-progress-fill {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #4e6bff, #5e93ff);
+  transition: width 220ms ease-out;
+}
+
+.export-meta {
+  display: grid;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.export-banner {
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+  border: 1px solid transparent;
+}
+
+.export-banner--error {
+  border-color: rgba(232, 64, 64, 0.35);
+  background: rgba(232, 64, 64, 0.14);
+  color: #ff9797;
+}
+
+.export-banner--info {
+  border-color: rgba(59, 165, 92, 0.35);
+  background: rgba(59, 165, 92, 0.14);
+  color: #9ae0ae;
+}
+
+@media (max-width: 900px) {
+  .export-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .export-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .export-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+}

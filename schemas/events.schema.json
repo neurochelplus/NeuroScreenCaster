@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "events.schema.json",
+  "title": "EventsFile",
+  "description": "NeuroScreenCaster telemetry events — schemaVersion 1",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "recordingId",
+    "startTimeMs",
+    "screenWidth",
+    "screenHeight",
+    "scaleFactor",
+    "events"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "recordingId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "startTimeMs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp (ms) of recording start — sync point with video"
+    },
+    "screenWidth": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "screenHeight": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "scaleFactor": {
+      "type": "number",
+      "minimum": 0.5,
+      "maximum": 4.0
+    },
+    "events": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/InputEvent" }
+    }
+  },
+  "$defs": {
+    "BoundingRect": {
+      "type": "object",
+      "required": ["x", "y", "width", "height"],
+      "additionalProperties": false,
+      "properties": {
+        "x": { "type": "integer" },
+        "y": { "type": "integer" },
+        "width": { "type": "integer", "minimum": 0 },
+        "height": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "UiContext": {
+      "type": "object",
+      "required": ["appName", "controlName", "boundingRect"],
+      "additionalProperties": false,
+      "properties": {
+        "appName": { "type": ["string", "null"] },
+        "controlName": { "type": ["string", "null"] },
+        "boundingRect": {
+          "oneOf": [
+            { "$ref": "#/$defs/BoundingRect" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "MouseButton": {
+      "type": "string",
+      "enum": ["left", "right", "middle"]
+    },
+    "ScrollDelta": {
+      "type": "object",
+      "required": ["dx", "dy"],
+      "additionalProperties": false,
+      "properties": {
+        "dx": { "type": "number" },
+        "dy": { "type": "number" }
+      }
+    },
+    "InputEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "ts", "x", "y"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "move" },
+            "ts": { "type": "integer", "minimum": 0 },
+            "x": { "type": "number" },
+            "y": { "type": "number" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "ts", "x", "y", "button", "uiContext"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "click" },
+            "ts": { "type": "integer", "minimum": 0 },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "button": { "$ref": "#/$defs/MouseButton" },
+            "uiContext": {
+              "oneOf": [
+                { "$ref": "#/$defs/UiContext" },
+                { "type": "null" }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "ts", "x", "y", "button"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "mouseUp" },
+            "ts": { "type": "integer", "minimum": 0 },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "button": { "$ref": "#/$defs/MouseButton" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "ts", "x", "y", "delta"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "scroll" },
+            "ts": { "type": "integer", "minimum": 0 },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "delta": { "$ref": "#/$defs/ScrollDelta" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "ts", "keyCode"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "keyDown" },
+            "ts": { "type": "integer", "minimum": 0 },
+            "keyCode": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "ts", "keyCode"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "keyUp" },
+            "ts": { "type": "integer", "minimum": 0 },
+            "keyCode": { "type": "string" }
+          }
+        }
+      ]
+    }
+  }
+}
