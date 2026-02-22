@@ -111,7 +111,11 @@ export default function ExportScreen() {
       setHeight(loaded.settings.export.height);
       setFps(loaded.settings.export.fps);
       const nextCodec = loaded.settings.export.codec.toLowerCase();
-      setCodec(CODEC_OPTIONS.includes(nextCodec as (typeof CODEC_OPTIONS)[number]) ? (nextCodec as (typeof CODEC_OPTIONS)[number]) : "h264");
+      setCodec(
+        CODEC_OPTIONS.includes(nextCodec as (typeof CODEC_OPTIONS)[number])
+          ? (nextCodec as (typeof CODEC_OPTIONS)[number])
+          : "h264"
+      );
     } catch (err) {
       setError(String(err));
     } finally {
@@ -204,118 +208,136 @@ export default function ExportScreen() {
 
   return (
     <div className="export-screen">
-      <div className="export-header">
-        <h1>Export</h1>
-        <p className="export-subtitle">Encode current project to MP4 using FFmpeg sidecar.</p>
+      <header className="export-header">
+        <div className="export-header-copy">
+          <h1>Export</h1>
+          <p className="export-subtitle">Render the edited timeline to a final video file.</p>
+        </div>
+        <div className={`export-pill ${status.isRunning ? "export-pill--active" : ""}`}>
+          {status.isRunning ? "Rendering" : "Ready"}
+        </div>
+      </header>
+
+      <div className="export-layout">
+        <div className="export-column">
+          <section className="export-card">
+            <div className="export-card-head">
+              <h2>Project</h2>
+              <button
+                className="btn-ghost"
+                onClick={() => void refreshProjects(false)}
+                disabled={isRefreshingProjects}
+              >
+                {isRefreshingProjects ? "Refreshing..." : "Refresh"}
+              </button>
+            </div>
+
+            <label className="export-field">
+              <span>Selected Recording</span>
+              <select
+                value={selectedProjectPath}
+                onChange={(event) => setSelectedProjectPath(event.target.value)}
+                disabled={isLoadingProject || projects.length === 0}
+              >
+                {projects.length === 0 ? (
+                  <option value="">No projects</option>
+                ) : (
+                  projects.map((item) => (
+                    <option key={item.projectPath} value={item.projectPath}>
+                      {item.name} | {formatMs(item.durationMs)} | {item.videoWidth}x{item.videoHeight}
+                    </option>
+                  ))
+                )}
+              </select>
+            </label>
+          </section>
+
+          <section className="export-card">
+            <h2>Output Settings</h2>
+            <div className="export-grid">
+              <label className="export-field">
+                <span>Width</span>
+                <input
+                  type="number"
+                  min={320}
+                  max={7680}
+                  value={width}
+                  onChange={(event) => setWidth(Math.max(320, Number(event.target.value) || 320))}
+                />
+              </label>
+              <label className="export-field">
+                <span>Height</span>
+                <input
+                  type="number"
+                  min={240}
+                  max={4320}
+                  value={height}
+                  onChange={(event) => setHeight(Math.max(240, Number(event.target.value) || 240))}
+                />
+              </label>
+              <label className="export-field">
+                <span>FPS</span>
+                <input
+                  type="number"
+                  min={10}
+                  max={120}
+                  value={fps}
+                  onChange={(event) => setFps(Math.max(10, Number(event.target.value) || 10))}
+                />
+              </label>
+              <label className="export-field">
+                <span>Codec</span>
+                <select
+                  value={codec}
+                  onChange={(event) => setCodec(event.target.value as (typeof CODEC_OPTIONS)[number])}
+                >
+                  {CODEC_OPTIONS.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div className="export-actions">
+              <button
+                className="btn-primary"
+                onClick={() => void handleStartExport()}
+                disabled={!selectedProjectPath || isStartingExport || status.isRunning}
+              >
+                {status.isRunning ? "Exporting..." : isStartingExport ? "Starting..." : "Start Export"}
+              </button>
+              <button className="btn-ghost" onClick={() => void handleResetStatus()} disabled={status.isRunning}>
+                Reset Status
+              </button>
+            </div>
+          </section>
+        </div>
+
+        <aside className="export-card export-card--status">
+          <h2>Status</h2>
+          <div className="export-status-row">
+            <span className="export-status-label">{status.message || "Idle"}</span>
+            <span className="export-status-value">{progressPercent}%</span>
+          </div>
+          <div className="export-progress">
+            <div className="export-progress-fill" style={{ width: `${progressPercent}%` }} />
+          </div>
+          <div className="export-meta">
+            <span>Project: {selectedProjectName || "n/a"}</span>
+            <span>Started: {formatDate(status.startedAtMs)}</span>
+            <span>Finished: {formatDate(status.finishedAtMs)}</span>
+            <span>Output: {status.outputPath ?? "n/a"}</span>
+          </div>
+        </aside>
       </div>
 
-      <section className="export-card">
-        <div className="export-card-head">
-          <h2>Project</h2>
-          <button className="btn-ghost" onClick={() => void refreshProjects(false)} disabled={isRefreshingProjects}>
-            {isRefreshingProjects ? "Refreshing..." : "Refresh"}
-          </button>
-        </div>
-
-        <label className="export-field">
-          <span>Selected Recording</span>
-          <select
-            value={selectedProjectPath}
-            onChange={(event) => setSelectedProjectPath(event.target.value)}
-            disabled={isLoadingProject || projects.length === 0}
-          >
-            {projects.length === 0 ? (
-              <option value="">No projects</option>
-            ) : (
-              projects.map((item) => (
-                <option key={item.projectPath} value={item.projectPath}>
-                  {item.name} | {formatMs(item.durationMs)} | {item.videoWidth}x{item.videoHeight}
-                </option>
-              ))
-            )}
-          </select>
-        </label>
-      </section>
-
-      <section className="export-card">
-        <h2>Output Settings</h2>
-        <div className="export-grid">
-          <label className="export-field">
-            <span>Width</span>
-            <input
-              type="number"
-              min={320}
-              max={7680}
-              value={width}
-              onChange={(event) => setWidth(Math.max(320, Number(event.target.value) || 320))}
-            />
-          </label>
-          <label className="export-field">
-            <span>Height</span>
-            <input
-              type="number"
-              min={240}
-              max={4320}
-              value={height}
-              onChange={(event) => setHeight(Math.max(240, Number(event.target.value) || 240))}
-            />
-          </label>
-          <label className="export-field">
-            <span>FPS</span>
-            <input
-              type="number"
-              min={10}
-              max={120}
-              value={fps}
-              onChange={(event) => setFps(Math.max(10, Number(event.target.value) || 10))}
-            />
-          </label>
-          <label className="export-field">
-            <span>Codec</span>
-            <select value={codec} onChange={(event) => setCodec(event.target.value as (typeof CODEC_OPTIONS)[number])}>
-              {CODEC_OPTIONS.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-
-        <div className="export-actions">
-          <button
-            className="btn-primary"
-            onClick={() => void handleStartExport()}
-            disabled={!selectedProjectPath || isStartingExport || status.isRunning}
-          >
-            {status.isRunning ? "Exporting..." : isStartingExport ? "Starting..." : "Start Export"}
-          </button>
-          <button className="btn-ghost" onClick={() => void handleResetStatus()} disabled={status.isRunning}>
-            Reset Status
-          </button>
-        </div>
-      </section>
-
-      <section className="export-card">
-        <h2>Status</h2>
-        <div className="export-status-row">
-          <span className="export-status-label">{status.message || "Idle"}</span>
-          <span className="export-status-value">{progressPercent}%</span>
-        </div>
-        <div className="export-progress">
-          <div className="export-progress-fill" style={{ width: `${progressPercent}%` }} />
-        </div>
-        <div className="export-meta">
-          <span>Project: {selectedProjectName || "n/a"}</span>
-          <span>Started: {formatDate(status.startedAtMs)}</span>
-          <span>Finished: {formatDate(status.finishedAtMs)}</span>
-          <span>Output: {status.outputPath ?? "n/a"}</span>
-        </div>
-      </section>
-
-      {status.error && <div className="export-banner export-banner--error">{status.error}</div>}
-      {error && <div className="export-banner export-banner--error">{error}</div>}
-      {info && <div className="export-banner export-banner--info">{info}</div>}
+      <div className="export-banners">
+        {status.error && <div className="export-banner export-banner--error">{status.error}</div>}
+        {error && <div className="export-banner export-banner--error">{error}</div>}
+        {info && <div className="export-banner export-banner--info">{info}</div>}
+      </div>
     </div>
   );
 }

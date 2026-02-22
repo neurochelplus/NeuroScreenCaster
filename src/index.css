@@ -1,73 +1,174 @@
+@import url("https://fonts.googleapis.com/css2?family=Fira+Code:wght@500;600&family=Outfit:wght@500;600;700&family=Work+Sans:wght@400;500;600&display=swap");
+
 :root {
-  --bg-primary: #0f0f0f;
-  --bg-secondary: #1a1a1a;
-  --bg-tertiary: #242424;
-  --border: #2e2e2e;
-  --text-primary: #e8e8e8;
-  --text-secondary: #888;
-  --accent: #5865f2;
-  --accent-hover: #4752c4;
-  --danger: #e84040;
-  --success: #3ba55c;
-  --radius: 8px;
+  --app-bg: #f8fafc;
+  --surface-1: #ffffff;
+  --surface-2: #f1f5f9;
+  --surface-3: #e6edf9;
+  --line: #dbe4f0;
+  --line-strong: #c6d3e5;
+
+  --ink-900: #1e3a8a;
+  --ink-700: #334155;
+  --ink-500: #64748b;
+
+  --primary-600: #1e40af;
+  --primary-500: #3b82f6;
+  --primary-700: #1d4ed8;
+  --action-500: #f59e0b;
+  --action-600: #d97706;
+  --danger-500: #dc2626;
+  --danger-600: #b91c1c;
+  --success-500: #16a34a;
+
+  --shadow-soft: 0 6px 20px rgba(30, 58, 138, 0.08);
+  --shadow-lift: 0 10px 30px rgba(30, 64, 175, 0.1);
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+
+  /* Backward-compatible aliases used by existing screens. */
+  --bg-primary: var(--app-bg);
+  --bg-secondary: var(--surface-1);
+  --bg-tertiary: var(--surface-2);
+  --border: var(--line);
+  --text-primary: var(--ink-900);
+  --text-secondary: var(--ink-700);
+  --accent: var(--primary-600);
+  --accent-hover: var(--primary-700);
+  --danger: var(--danger-500);
+  --success: var(--success-500);
+  --radius: var(--radius-sm);
 }
 
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
-  margin: 0;
-  padding: 0;
 }
 
 html,
 body,
 #root {
   height: 100%;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  background: var(--bg-primary);
+}
+
+body {
+  margin: 0;
+  font-family: "Work Sans", "Segoe UI", system-ui, sans-serif;
+  background: radial-gradient(1200px 800px at 0% 0%, #eef4ff 0%, #f8fafc 45%, #f8fafc 100%);
   color: var(--text-primary);
   font-size: 14px;
-  line-height: 1.5;
+  line-height: 1.45;
   user-select: none;
   -webkit-user-select: none;
 }
 
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: "Outfit", "Work Sans", "Segoe UI", sans-serif;
+  line-height: 1.2;
+  margin: 0;
+  color: var(--text-primary);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
 button {
   cursor: pointer;
-  border: none;
+  border: 1px solid transparent;
   outline: none;
-  font-family: inherit;
-  font-size: 14px;
-  border-radius: var(--radius);
-  padding: 8px 16px;
-  transition: background 0.15s, opacity 0.15s;
+  border-radius: var(--radius-sm);
+  padding: 8px 14px;
+  transition:
+    background-color 0.18s ease,
+    border-color 0.18s ease,
+    color 0.18s ease,
+    box-shadow 0.18s ease;
 }
 
 button:disabled {
-  opacity: 0.5;
+  opacity: 0.55;
   cursor: not-allowed;
 }
 
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary-500) 60%, white);
+  outline-offset: 2px;
+}
+
+input,
+select,
+textarea {
+  border: 1px solid var(--line-strong);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+}
+
 .btn-primary {
-  background: var(--accent);
+  background: var(--primary-600);
   color: #fff;
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: var(--accent-hover);
+  background: var(--primary-700);
 }
 
-.btn-danger {
-  background: var(--danger);
+.btn-action {
+  background: var(--action-500);
   color: #fff;
 }
 
+.btn-action:hover:not(:disabled) {
+  background: var(--action-600);
+}
+
+.btn-danger {
+  background: var(--danger-500);
+  color: #fff;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger-600);
+}
+
 .btn-ghost {
-  background: transparent;
+  background: var(--surface-1);
   color: var(--text-secondary);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-strong);
 }
 
 .btn-ghost:hover:not(:disabled) {
-  background: var(--bg-tertiary);
+  background: var(--surface-2);
+  border-color: var(--primary-500);
   color: var(--text-primary);
+}
+
+.mono {
+  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
 }

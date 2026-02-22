@@ -16,12 +16,14 @@ function MainApp() {
   return (
     <div className="app-layout">
       <Navigation currentScreen={screen} onNavigate={setScreen} />
-      <main className="app-content">
-        <section className={screen === "record" ? "screen-pane" : "screen-pane screen-pane--hidden"}>
-          <RecordScreen isActive={screen === "record"} />
-        </section>
-        {screen === "edit" && <EditScreen />}
-        {screen === "export" && <ExportScreen />}
+      <main className={`app-content app-content--${screen}`}>
+        <div className={`app-content-frame app-content-frame--${screen}`}>
+          <section className={screen === "record" ? "screen-pane" : "screen-pane screen-pane--hidden"}>
+            <RecordScreen isActive={screen === "record"} />
+          </section>
+          {screen === "edit" && <EditScreen />}
+          {screen === "export" && <ExportScreen />}
+        </div>
       </main>
     </div>
   );

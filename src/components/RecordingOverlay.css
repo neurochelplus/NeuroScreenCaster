@@ -21,15 +21,58 @@
   box-shadow: none;
 }
 
-.recording-overlay-panel button {
-  padding: 6px 12px;
-  font-size: 13px;
-}
-
 .recording-overlay-time {
   min-width: 62px;
   text-align: center;
   font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.4px;
+}
+
+.recording-overlay-icon-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  display: grid;
+  place-items: center;
+  color: #ffffff;
+}
+
+.recording-overlay-icon-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.recording-overlay-icon-btn--ghost {
+  background: rgba(148, 163, 184, 0.22);
+  border-color: rgba(148, 163, 184, 0.4);
+}
+
+.recording-overlay-icon-btn--ghost:hover:not(:disabled) {
+  background: rgba(148, 163, 184, 0.32);
+}
+
+.recording-overlay-icon-btn--primary {
+  background: rgba(59, 130, 246, 0.88);
+  border-color: rgba(147, 197, 253, 0.7);
+}
+
+.recording-overlay-icon-btn--primary:hover:not(:disabled) {
+  background: rgba(37, 99, 235, 0.95);
+}
+
+.recording-overlay-icon-btn--danger {
+  background: rgba(220, 38, 38, 0.9);
+  border-color: rgba(252, 165, 165, 0.65);
+}
+
+.recording-overlay-icon-btn--danger:hover:not(:disabled) {
+  background: rgba(185, 28, 28, 0.95);
+}
+
+.recording-overlay-icon-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }

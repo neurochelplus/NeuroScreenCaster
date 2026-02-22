@@ -1,126 +1,212 @@
 .record-screen {
   height: 100%;
-  display: flex;
-  flex-direction: column;
+  min-height: 0;
 }
 
 .record-workspace {
   min-height: 0;
-  flex: 1;
+  height: 100%;
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
+  grid-template-columns: minmax(300px, 340px) minmax(0, 1fr);
   gap: 18px;
 }
 
 .record-settings {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px;
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-soft);
+  padding: 18px;
   display: flex;
   flex-direction: column;
   gap: 14px;
 }
 
-.record-settings h2 {
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.record-settings label,
-.record-fps {
+.record-settings-header {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 5px;
 }
 
-.record-settings label span,
-.record-fps span {
-  font-size: 12px;
-  color: var(--text-secondary);
-  letter-spacing: 0.2px;
-}
-
-.record-settings select {
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border);
-  color: var(--text-primary);
-  border-radius: 8px;
-  padding: 9px 10px;
-  font-size: 13px;
-}
-
-.record-fps-options {
-  display: flex;
-  gap: 8px;
-}
-
-.record-fps-options button {
-  flex: 1;
-}
-
-.record-fps-options .record-fps-btn[data-active="true"] {
-  background: var(--accent);
-  border-color: transparent;
-  color: #fff;
-  opacity: 1;
-}
-
-.record-fps-options .record-fps-btn[data-active="true"]:disabled {
-  opacity: 1;
-}
-
-.record-fps-current {
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.record-stage {
-  min-height: 0;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.record-stage-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-}
-
-.record-stage-header h1 {
+.record-settings-header h2 {
   font-size: 20px;
   font-weight: 600;
 }
 
-.record-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.record-settings-header p {
+  margin: 0;
+  color: var(--ink-700);
   font-size: 13px;
-  color: var(--text-secondary);
 }
 
-.record-status--active {
+.record-settings-group {
+  display: grid;
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: linear-gradient(180deg, #fbfdff 0%, #f8fbff 100%);
+}
+
+.record-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.record-field-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-700);
+  letter-spacing: 0.015em;
+}
+
+.record-field select {
+  height: 38px;
+  padding: 0 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-strong);
+  background: var(--surface-1);
   color: var(--text-primary);
 }
 
+.record-field select:disabled {
+  opacity: 0.6;
+}
+
+.record-field--fps {
+  gap: 9px;
+}
+
+.record-fps-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.record-fps-btn {
+  min-height: 38px;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-1);
+  color: var(--ink-700);
+  font-weight: 600;
+}
+
+.record-fps-btn:hover:not(:disabled) {
+  border-color: var(--primary-500);
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--surface-2) 80%, white 20%);
+}
+
+.record-fps-btn--active,
+.record-fps-btn[data-active="true"] {
+  color: #fff;
+  border-color: transparent;
+  background: linear-gradient(155deg, var(--primary-500), var(--primary-600));
+  box-shadow: 0 8px 18px rgba(30, 64, 175, 0.22);
+}
+
+.record-fps-current {
+  font-size: 12px;
+  color: var(--ink-500);
+}
+
+.record-settings-footnote {
+  margin-top: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.record-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink-700);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.record-stage {
+  min-height: 0;
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-soft);
+  padding: 18px;
+  display: grid;
+  gap: 12px;
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+}
+
+.record-stage-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.record-stage-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.record-stage-title-wrap h1 {
+  font-size: clamp(22px, 2.1vw, 28px);
+  font-weight: 600;
+}
+
+.record-stage-title-wrap p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-700);
+}
+
+.record-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 11px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink-700);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.record-status--active {
+  border-color: rgba(220, 38, 38, 0.3);
+  background: rgba(220, 38, 38, 0.08);
+  color: var(--danger-600);
+}
+
 .record-indicator {
-  width: 10px;
-  height: 10px;
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
-  background: var(--border);
+  background: var(--line-strong);
+  flex: 0 0 9px;
 }
 
 .record-status--active .record-indicator {
-  background: var(--danger);
-  box-shadow: 0 0 0 0 rgba(232, 64, 64, 0.45);
-  animation: record-pulse 1.5s ease-in-out infinite;
+  background: var(--danger-500);
+  box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.35);
+  animation: record-pulse 1.4s ease-in-out infinite;
+}
+
+.record-stage-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .record-stage-controls {
@@ -130,18 +216,42 @@
 }
 
 .record-btn {
-  font-size: 14px;
+  min-height: 38px;
+  padding: 0 16px;
+  font-size: 13px;
   font-weight: 600;
-  padding: 9px 18px;
+}
+
+.record-stage-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--surface-2) 76%, white 24%);
+}
+
+.record-meta-label {
+  font-size: 11px;
+  color: var(--ink-500);
+  font-weight: 600;
+}
+
+.record-meta-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-900);
 }
 
 .record-preview-shell {
-  flex: 1;
-  min-height: 300px;
-  background: #090b12;
-  border: 1px solid #232734;
-  border-radius: 10px;
+  min-height: 340px;
+  border: 1px solid #1b2d50;
+  border-radius: 14px;
   overflow: hidden;
+  background: radial-gradient(140% 130% at 0% 0%, #14274b 0%, #0d1830 46%, #0b1325 100%);
+  box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.2);
   display: flex;
 }
 
@@ -149,52 +259,100 @@
   width: 100%;
   height: 100%;
   object-fit: contain;
-  background: #08090d;
+  background: #090f1c;
 }
 
 .record-preview-placeholder {
   flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
+  display: grid;
+  place-items: center;
   text-align: center;
-  color: var(--text-secondary);
-  padding: 20px;
+  gap: 10px;
+  padding: 22px;
+  color: #9fb1d1;
 }
 
 .record-preview-placeholder strong {
-  color: var(--text-primary);
-  font-size: 14px;
+  color: #edf4ff;
+  font-size: 15px;
+}
+
+.record-stage-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 32px;
+  padding: 0 2px;
+}
+
+.record-footer-item {
+  color: var(--ink-700);
+  font-size: 12px;
+  font-weight: 500;
 }
 
 .record-error {
-  color: var(--danger);
+  color: var(--danger-600);
   font-size: 13px;
-  background: rgba(232, 64, 64, 0.1);
-  border: 1px solid rgba(232, 64, 64, 0.35);
-  border-radius: 8px;
+  background: rgba(220, 38, 38, 0.08);
+  border: 1px solid rgba(220, 38, 38, 0.32);
+  border-radius: var(--radius-sm);
   padding: 10px 12px;
 }
 
 @keyframes record-pulse {
   0%,
   100% {
-    box-shadow: 0 0 0 0 rgba(232, 64, 64, 0.45);
+    box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.35);
   }
   50% {
-    box-shadow: 0 0 0 7px rgba(232, 64, 64, 0);
+    box-shadow: 0 0 0 7px rgba(220, 38, 38, 0);
   }
 }
 
-@media (max-width: 1000px) {
+@media (max-width: 1180px) {
   .record-workspace {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
   }
 
+  .record-settings {
+    order: 1;
+  }
+
+  .record-stage {
+    order: 2;
+  }
+}
+
+@media (max-width: 760px) {
+  .record-stage {
+    padding: 14px;
+  }
+
+  .record-stage-header,
+  .record-stage-toolbar,
+  .record-stage-footer {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .record-stage-controls {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .record-btn {
+    flex: 1 1 170px;
+  }
+
+  .record-stage-meta {
+    width: 100%;
+    justify-content: space-between;
+  }
+
   .record-preview-shell {
-    min-height: 240px;
+    min-height: 250px;
   }
 }

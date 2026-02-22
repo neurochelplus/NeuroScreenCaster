@@ -2,12 +2,35 @@
   display: flex;
   flex-direction: column;
   height: 100%;
+  min-height: 100%;
 }
 
 .app-content {
   flex: 1;
   overflow: auto;
-  padding: 24px;
+  padding: 18px 20px 24px;
+}
+
+.app-content-frame {
+  max-width: 1580px;
+  margin: 0 auto;
+  min-height: 100%;
+}
+
+.app-content--edit {
+  overflow: hidden;
+}
+
+.app-content-frame--edit {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+.app-content-frame--edit .edit-shell {
+  flex: 1;
+  min-height: 0;
 }
 
 .screen-pane {
@@ -16,4 +39,10 @@
 
 .screen-pane--hidden {
   display: none;
+}
+
+@media (max-width: 1024px) {
+  .app-content {
+    padding: 14px 12px 18px;
+  }
 }

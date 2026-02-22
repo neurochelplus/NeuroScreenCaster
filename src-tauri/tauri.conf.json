@@ -20,7 +20,7 @@
         "minHeight": 600,
         "maximized": true,
         "resizable": true,
-        "decorations": true
+        "decorations": false
       }
     ],
     "security": {

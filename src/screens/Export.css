@@ -1,41 +1,94 @@
 .export-screen {
-  max-width: 980px;
-  margin: 0 auto;
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  background: var(--surface-1);
+  padding: 14px;
+}
+
+.export-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.export-header-copy {
+  display: grid;
+  gap: 4px;
 }
 
 .export-header h1 {
-  font-size: 22px;
+  font-size: clamp(22px, 2.2vw, 28px);
   font-weight: 700;
-  margin-bottom: 4px;
 }
 
 .export-subtitle {
-  color: var(--text-secondary);
+  margin: 0;
+  color: var(--ink-700);
   font-size: 13px;
 }
 
-.export-card {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 14px;
+.export-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 84px;
+  min-height: 30px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line-strong);
+  background: var(--surface-2);
+  color: var(--ink-700);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.export-pill--active {
+  border-color: rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.14);
+  color: var(--action-600);
+}
+
+.export-layout {
+  flex: 1;
+  min-height: 0;
   display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 360px);
   gap: 12px;
+}
+
+.export-column {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto;
+  gap: 12px;
+  align-content: start;
+}
+
+.export-card {
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+  min-height: 0;
 }
 
 .export-card h2 {
   font-size: 16px;
-  font-weight: 600;
+  font-weight: 700;
 }
 
 .export-card-head {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  gap: 10px;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .export-field {
@@ -44,108 +97,138 @@
 }
 
 .export-field span {
-  color: var(--text-secondary);
+  color: var(--ink-700);
   font-size: 12px;
   font-weight: 600;
 }
 
 .export-field input,
 .export-field select {
-  border: 1px solid var(--border);
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-  border-radius: 8px;
-  padding: 8px 10px;
+  min-height: 38px;
+  border: 1px solid var(--line-strong);
+  background: #fff;
+  color: var(--ink-900);
+  border-radius: var(--radius-sm);
+  padding: 0 10px;
   font: inherit;
 }
 
 .export-field input:focus,
 .export-field select:focus {
   outline: none;
-  border-color: var(--accent);
+  border-color: var(--primary-500);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary-500) 24%, #fff);
 }
 
 .export-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
 
 .export-actions {
   display: flex;
+  align-items: center;
   gap: 8px;
+}
+
+.export-card--status {
+  align-content: start;
 }
 
 .export-status-row {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  justify-content: space-between;
   gap: 10px;
 }
 
 .export-status-label {
-  color: var(--text-primary);
+  color: var(--ink-900);
+  font-size: 13px;
 }
 
 .export-status-value {
-  color: var(--text-secondary);
-  font-family: Consolas, monospace;
+  color: var(--ink-700);
+  font-size: 13px;
+  font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .export-progress {
-  height: 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--bg-tertiary);
+  height: 12px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line-strong);
+  background: #fff;
   overflow: hidden;
 }
 
 .export-progress-fill {
   height: 100%;
   width: 0;
-  background: linear-gradient(90deg, #4e6bff, #5e93ff);
-  transition: width 220ms ease-out;
+  background: linear-gradient(90deg, var(--primary-500), var(--primary-600));
+  transition: width 0.22s ease-out;
 }
 
 .export-meta {
   display: grid;
   gap: 6px;
-  color: var(--text-secondary);
+  color: var(--ink-700);
   font-size: 12px;
+  word-break: break-word;
+}
+
+.export-banners {
+  display: grid;
+  gap: 8px;
 }
 
 .export-banner {
-  border-radius: 10px;
-  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  padding: 9px 11px;
   font-size: 13px;
   border: 1px solid transparent;
 }
 
 .export-banner--error {
-  border-color: rgba(232, 64, 64, 0.35);
-  background: rgba(232, 64, 64, 0.14);
-  color: #ff9797;
+  border-color: rgba(220, 38, 38, 0.32);
+  background: rgba(220, 38, 38, 0.08);
+  color: var(--danger-600);
 }
 
 .export-banner--info {
-  border-color: rgba(59, 165, 92, 0.35);
-  background: rgba(59, 165, 92, 0.14);
-  color: #9ae0ae;
+  border-color: rgba(22, 163, 74, 0.3);
+  background: rgba(22, 163, 74, 0.08);
+  color: #0f8a3c;
 }
 
-@media (max-width: 900px) {
-  .export-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+@media (max-width: 1080px) {
+  .export-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .export-card--status {
+    order: -1;
   }
 }
 
-@media (max-width: 640px) {
+@media (max-width: 760px) {
+  .export-screen {
+    border-radius: 12px;
+    padding: 10px;
+    overflow: auto;
+  }
+
+  .export-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
   .export-grid {
     grid-template-columns: 1fr;
   }
 
   .export-actions {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
+    flex-direction: column;
+    align-items: stretch;
   }
 }

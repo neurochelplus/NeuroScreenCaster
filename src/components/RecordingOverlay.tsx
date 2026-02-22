@@ -24,6 +24,31 @@ const INITIAL_OVERLAY_STATE: RecordingOverlayUpdatePayload = {
   hidden: false,
 };
 
+function PauseIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <rect x="4.6" y="4.2" width="3.9" height="11.6" rx="1.1" fill="currentColor" />
+      <rect x="11.5" y="4.2" width="3.9" height="11.6" rx="1.1" fill="currentColor" />
+    </svg>
+  );
+}
+
+function ResumeIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path d="M6.2 4.7 15 10l-8.8 5.3V4.7Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function StopIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <rect x="5" y="5" width="10" height="10" rx="2.2" fill="currentColor" />
+    </svg>
+  );
+}
+
 export default function RecordingOverlay() {
   const [overlayState, setOverlayState] = useState<RecordingOverlayUpdatePayload>(
     INITIAL_OVERLAY_STATE
@@ -115,23 +140,35 @@ export default function RecordingOverlay() {
         </span>
 
         {overlayState.state === "recording" && (
-          <button className="btn-ghost" onClick={handlePause}>
-            Pause
+          <button
+            className="recording-overlay-icon-btn recording-overlay-icon-btn--ghost"
+            onClick={handlePause}
+            aria-label="Pause recording"
+            title="Pause"
+          >
+            <PauseIcon />
           </button>
         )}
 
         {overlayState.state === "paused" && (
-          <button className="btn-primary" onClick={handleResume}>
-            Resume
+          <button
+            className="recording-overlay-icon-btn recording-overlay-icon-btn--primary"
+            onClick={handleResume}
+            aria-label="Resume recording"
+            title="Resume"
+          >
+            <ResumeIcon />
           </button>
         )}
 
         <button
-          className="btn-danger"
+          className="recording-overlay-icon-btn recording-overlay-icon-btn--danger"
           onClick={handleStop}
           disabled={overlayState.state === "stopping"}
+          aria-label={overlayState.state === "stopping" ? "Stopping recording" : "Stop recording"}
+          title={overlayState.state === "stopping" ? "Stopping..." : "Stop"}
         >
-          {overlayState.state === "stopping" ? "Saving..." : "Stop"}
+          <StopIcon />
         </button>
       </div>
     </div>

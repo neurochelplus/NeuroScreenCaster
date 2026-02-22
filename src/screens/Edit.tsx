@@ -92,6 +92,41 @@ const VECTOR_CURSOR_DATA_URI = `data:image/svg+xml;utf8,${encodeURIComponent(
   "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 72 110'><path d='M0 0 L0 90 L22 70 L35 110 L50 102 L38 63 L72 63 Z' fill='#000000' stroke='#ffffff' stroke-width='6' stroke-linejoin='round'/></svg>"
 )}`;
 
+function SeekBackIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path d="M6 4.5v11" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <path d="m14.5 5.2-6.2 4.8 6.2 4.8V5.2Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function SeekForwardIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path d="M14 4.5v11" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <path d="m5.5 5.2 6.2 4.8-6.2 4.8V5.2Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function PlayIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path d="m6.4 4.8 8.5 5.2-8.5 5.2V4.8Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function PauseIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <rect x="5.2" y="4.7" width="3.7" height="10.6" rx="1.2" fill="currentColor" />
+      <rect x="11.1" y="4.7" width="3.7" height="10.6" rx="1.2" fill="currentColor" />
+    </svg>
+  );
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
@@ -1911,15 +1946,32 @@ export default function EditScreen() {
               </div>
 
               <div className="preview-controls">
-                <button className="btn-ghost" onClick={() => seekBy(-5000)}>
-                  -5s
-                </button>
-                <button className="btn-primary" onClick={() => void togglePlayback()}>
-                  {isVideoPlaying ? "Pause" : "Play"}
-                </button>
-                <button className="btn-ghost" onClick={() => seekBy(5000)}>
-                  +5s
-                </button>
+                <div className="preview-controls-row">
+                  <button
+                    className="btn-ghost preview-control-btn"
+                    onClick={() => seekBy(-5000)}
+                    aria-label="Back 5 seconds"
+                    title="Back 5 seconds"
+                  >
+                    <SeekBackIcon />
+                  </button>
+                  <button
+                    className="btn-primary preview-control-btn"
+                    onClick={() => void togglePlayback()}
+                    aria-label={isVideoPlaying ? "Pause" : "Play"}
+                    title={isVideoPlaying ? "Pause" : "Play"}
+                  >
+                    {isVideoPlaying ? <PauseIcon /> : <PlayIcon />}
+                  </button>
+                  <button
+                    className="btn-ghost preview-control-btn"
+                    onClick={() => seekBy(5000)}
+                    aria-label="Forward 5 seconds"
+                    title="Forward 5 seconds"
+                  >
+                    <SeekForwardIcon />
+                  </button>
+                </div>
                 <span className="preview-time">
                   {formatMs(playheadMs)} / {formatMs(previewDurationMs)}
                 </span>

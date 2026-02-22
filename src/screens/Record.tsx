@@ -87,6 +87,7 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
   const ctrlPollRef = useRef<number | null>(null);
   const ctrlRequestInFlightRef = useRef(false);
   const overlayWindowRef = useRef<WebviewWindow | null>(null);
+  const overlayHiddenRef = useRef<boolean | null>(null);
 
   useEffect(() => {
     stateRef.current = state;
@@ -129,6 +130,7 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
       // Window may already be closed.
     } finally {
       overlayWindowRef.current = null;
+      overlayHiddenRef.current = null;
     }
   }, []);
 
@@ -198,13 +200,22 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
         return;
       }
 
+      if (hidden) {
+        if (overlayHiddenRef.current !== true) {
+          await closeOverlayWindow();
+          overlayHiddenRef.current = true;
+        }
+        return;
+      }
+
       const overlayWindow = await ensureOverlayWindow();
       try {
-        await overlayWindow.setIgnoreCursorEvents(hidden);
+        await overlayWindow.setIgnoreCursorEvents(false);
       } catch {
-        // Some runtimes/capabilities may reject click-through toggling.
-        // Overlay visibility updates must still be delivered.
+        // Ignore unsupported click-through toggle.
       }
+      overlayHiddenRef.current = false;
+
       const payload: RecordingOverlayUpdatePayload = {
         recordingId: nextRecordingId,
         state: nextState,
@@ -479,110 +490,137 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
   }, [handlePause, handleResume, handleStop]);
 
   const isIdle = state === "idle";
+  const statusText =
+    state === "idle"
+      ? "Ready to record"
+      : state === "recording"
+      ? `Recording ${formatDuration(duration)}`
+      : state === "paused"
+      ? `Paused ${formatDuration(duration)}`
+      : "Saving...";
 
   return (
     <div className="record-screen">
       <div className="record-workspace">
         <aside className="record-settings">
-          <h2>Recording Settings</h2>
+          <header className="record-settings-header">
+            <h2>Capture Setup</h2>
+            <p>Configure trigger, quality, and frame rate before starting.</p>
+          </header>
 
-          <label>
-            <span>Auto Zoom Trigger</span>
-            <select
-              value={autoZoomTriggerMode}
-              onChange={(event) => setAutoZoomTriggerMode(event.target.value as AutoZoomTriggerMode)}
-              disabled={!isIdle}
-            >
-              <option value="single-click">1 click</option>
-              <option value="multi-click-window">2 clicks in 3 seconds</option>
-              <option value="ctrl-click">Ctrl + click</option>
-            </select>
-          </label>
-
-          <label>
-            <span>Recording Quality</span>
-            <select
-              value={recordingQuality}
-              onChange={(event) => setRecordingQuality(event.target.value as RecordingQuality)}
-              disabled={!isIdle}
-            >
-              <option value="low">Low</option>
-              <option value="balanced">Balanced</option>
-              <option value="high">High</option>
-            </select>
-          </label>
-
-          <div className="record-fps">
-            <span>Capture FPS</span>
-            <div className="record-fps-options">
-              <button
-                type="button"
-                className={`btn-ghost record-fps-btn ${recordingFps === 30 ? "record-fps-btn--active" : ""}`}
-                data-active={recordingFps === 30}
-                onClick={() => setRecordingFps(30)}
+          <section className="record-settings-group">
+            <label className="record-field">
+              <span className="record-field-label">Auto Zoom Trigger</span>
+              <select
+                value={autoZoomTriggerMode}
+                onChange={(event) => setAutoZoomTriggerMode(event.target.value as AutoZoomTriggerMode)}
                 disabled={!isIdle}
               >
-                30 FPS
-              </button>
-              <button
-                type="button"
-                className={`btn-ghost record-fps-btn ${recordingFps === 60 ? "record-fps-btn--active" : ""}`}
-                data-active={recordingFps === 60}
-                onClick={() => setRecordingFps(60)}
+                <option value="single-click">1 click</option>
+                <option value="multi-click-window">2 clicks in 3 seconds</option>
+                <option value="ctrl-click">Ctrl + click</option>
+              </select>
+            </label>
+
+            <label className="record-field">
+              <span className="record-field-label">Recording Quality</span>
+              <select
+                value={recordingQuality}
+                onChange={(event) => setRecordingQuality(event.target.value as RecordingQuality)}
                 disabled={!isIdle}
               >
-                60 FPS
-              </button>
+                <option value="low">Low</option>
+                <option value="balanced">Balanced</option>
+                <option value="high">High</option>
+              </select>
+            </label>
+          </section>
+
+          <section className="record-settings-group">
+            <div className="record-field record-field--fps">
+              <span className="record-field-label">Capture FPS</span>
+              <div className="record-fps-options">
+                <button
+                  type="button"
+                  className={`record-fps-btn ${recordingFps === 30 ? "record-fps-btn--active" : ""}`}
+                  data-active={recordingFps === 30}
+                  onClick={() => setRecordingFps(30)}
+                  disabled={!isIdle}
+                >
+                  30 FPS
+                </button>
+                <button
+                  type="button"
+                  className={`record-fps-btn ${recordingFps === 60 ? "record-fps-btn--active" : ""}`}
+                  data-active={recordingFps === 60}
+                  onClick={() => setRecordingFps(60)}
+                  disabled={!isIdle}
+                >
+                  60 FPS
+                </button>
+              </div>
+              <small className="record-fps-current">Selected: {recordingFps} FPS</small>
             </div>
-            <small className="record-fps-current">Selected: {recordingFps} FPS</small>
+          </section>
+
+          <div className="record-settings-footnote">
+            <span className="record-chip">Default trigger: 1 click</span>
+            <span className="record-chip">Hold Ctrl to hide overlay</span>
           </div>
         </aside>
 
         <section className="record-stage">
-          <div className="record-stage-header">
-            <h1>Record</h1>
+          <header className="record-stage-header">
+            <div className="record-stage-title-wrap">
+              <h1>Screen Capture</h1>
+              <p>Live monitor preview with minimal-latency recording controls.</p>
+            </div>
             <div className={`record-status ${state === "recording" ? "record-status--active" : ""}`}>
               <div className="record-indicator" />
-              <span>
-                {state === "idle" && "Ready to record"}
-                {state === "recording" && `Recording ${formatDuration(duration)}`}
-                {state === "paused" && `Paused ${formatDuration(duration)}`}
-                {state === "stopping" && "Saving..."}
+              <span>{statusText}</span>
+            </div>
+          </header>
+
+          <div className="record-stage-toolbar">
+            <div className="record-stage-controls">
+              {state === "idle" && (
+                <button className="btn-action record-btn" onClick={handleStart}>
+                  Start Recording
+                </button>
+              )}
+              {state === "recording" && (
+                <>
+                  <button className="btn-ghost record-btn" onClick={handlePause}>
+                    Pause
+                  </button>
+                  <button className="btn-danger record-btn" onClick={handleStop}>
+                    Stop
+                  </button>
+                </>
+              )}
+              {state === "paused" && (
+                <>
+                  <button className="btn-primary record-btn" onClick={handleResume}>
+                    Resume
+                  </button>
+                  <button className="btn-danger record-btn" onClick={handleStop}>
+                    Stop
+                  </button>
+                </>
+              )}
+              {state === "stopping" && (
+                <button className="btn-ghost record-btn" disabled>
+                  Saving...
+                </button>
+              )}
+            </div>
+
+            <div className="record-stage-meta">
+              <span className="record-meta-label">Session</span>
+              <span className="record-meta-value mono">
+                {recordingId ? recordingId.slice(0, 8).toUpperCase() : "NOT STARTED"}
               </span>
             </div>
-          </div>
-
-          <div className="record-stage-controls">
-            {state === "idle" && (
-              <button className="btn-primary record-btn" onClick={handleStart}>
-                Start Recording
-              </button>
-            )}
-            {state === "recording" && (
-              <>
-                <button className="btn-ghost record-btn" onClick={handlePause}>
-                  Pause
-                </button>
-                <button className="btn-danger record-btn" onClick={handleStop}>
-                  Stop
-                </button>
-              </>
-            )}
-            {state === "paused" && (
-              <>
-                <button className="btn-primary record-btn" onClick={handleResume}>
-                  Resume
-                </button>
-                <button className="btn-danger record-btn" onClick={handleStop}>
-                  Stop
-                </button>
-              </>
-            )}
-            {state === "stopping" && (
-              <button className="btn-ghost record-btn" disabled>
-                Saving...
-              </button>
-            )}
           </div>
 
           <div className="record-preview-shell">
@@ -605,12 +643,20 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
             )}
           </div>
 
+          <footer className="record-stage-footer">
+            <span className="record-footer-item">
+              {isCtrlPressed
+                ? "Overlay controls hidden while Ctrl is pressed."
+                : "Hold Ctrl to temporarily hide overlay controls."}
+            </span>
+            <span className="record-footer-item mono">Elapsed {formatDuration(duration)}</span>
+          </footer>
+
           {error && (
             <div className="record-error">
               <strong>Error:</strong> {error}
             </div>
           )}
-
         </section>
       </div>
     </div>

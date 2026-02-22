@@ -21,3 +21,4 @@ src-tauri/binaries/*.exe
 .DS_Store
 Thumbs.db
 .claude/
+.codex/
