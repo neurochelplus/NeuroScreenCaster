@@ -140,7 +140,9 @@ export default function Navigation({ currentScreen, onNavigate }: NavigationProp
           data-tauri-drag-region
           onDoubleClick={() => handleToggleMaximize()}
         >
-          <div className="nav-brand-mark">NS</div>
+          <div className="nav-brand-mark">
+            <img className="nav-brand-mark-img" src="/favicon.png" alt="NeuroScreenCaster logo" />
+          </div>
           <div className="nav-brand-copy">
             <span className="nav-title">NeuroScreenCaster</span>
             <span className="nav-subtitle">Operator Grid</span>

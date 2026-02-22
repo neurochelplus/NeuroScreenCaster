@@ -88,6 +88,10 @@ const CLICK_PULSE_TOTAL_MS = 150;
 const CLICK_PULSE_DOWN_MS = 65;
 const VECTOR_CURSOR_WIDTH = 72;
 const VECTOR_CURSOR_HEIGHT = 110;
+const TIMELINE_MIN_ZOOM_PERCENT = 0;
+const TIMELINE_MAX_ZOOM_PERCENT = 100;
+const TIMELINE_DEFAULT_ZOOM_PERCENT = 50;
+const TIMELINE_MAX_VISIBLE_WINDOW_MS = 10_000;
 const VECTOR_CURSOR_DATA_URI = `data:image/svg+xml;utf8,${encodeURIComponent(
   "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 72 110'><path d='M0 0 L0 90 L22 70 L35 110 L50 102 L38 63 L72 63 Z' fill='#000000' stroke='#ffffff' stroke-width='6' stroke-linejoin='round'/></svg>"
 )}`;
@@ -123,6 +127,25 @@ function PauseIcon() {
     <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
       <rect x="5.2" y="4.7" width="3.7" height="10.6" rx="1.2" fill="currentColor" />
       <rect x="11.1" y="4.7" width="3.7" height="10.6" rx="1.2" fill="currentColor" />
+    </svg>
+  );
+}
+
+function VolumeIcon({ muted }: { muted: boolean }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path
+        d="M3.4 8.1h2.3l3.2-2.8v9.4l-3.2-2.8H3.4V8.1Z"
+        fill="currentColor"
+      />
+      {muted ? (
+        <path d="m12.2 8.3 4 4m0-4-4 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      ) : (
+        <>
+          <path d="M12.4 8.2c1.1 1.1 1.1 2.5 0 3.6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          <path d="M14.3 6.4c2.1 2.1 2.1 5.2 0 7.3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+        </>
+      )}
     </svg>
   );
 }
@@ -826,7 +849,22 @@ function buildFollowCursorTargetPoints(
 function chooseMarkerStepMs(pxPerMs: number): number {
   const targetSpacingPx = 90;
   const approxStepMs = targetSpacingPx / Math.max(pxPerMs, 0.0001);
-  const options = [250, 500, 1_000, 2_000, 5_000, 10_000, 15_000, 30_000, 60_000];
+  const options = [
+    250,
+    500,
+    1_000,
+    2_000,
+    5_000,
+    10_000,
+    15_000,
+    30_000,
+    60_000,
+    120_000,
+    300_000,
+    600_000,
+    900_000,
+    1_800_000,
+  ];
   for (const option of options) {
     if (option >= approxStepMs) {
       return option;
@@ -845,12 +883,15 @@ export default function EditScreen() {
   const [previewStageSize, setPreviewStageSize] = useState({ width: 0, height: 0 });
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const [playheadMs, setPlayheadMs] = useState(0);
-  const [timelineZoom, setTimelineZoom] = useState(1);
+  const [timelineZoomPercent, setTimelineZoomPercent] = useState(
+    TIMELINE_DEFAULT_ZOOM_PERCENT
+  );
   const [timelineViewportWidthPx, setTimelineViewportWidthPx] = useState(0);
   const [isRefreshingProjects, setIsRefreshingProjects] = useState(false);
   const [isLoadingProject, setIsLoadingProject] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isVideoPlaying, setIsVideoPlaying] = useState(false);
+  const [previewVolume, setPreviewVolume] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [eventsError, setEventsError] = useState<string | null>(null);
@@ -920,13 +961,36 @@ export default function EditScreen() {
   const previewCursorHeightPx = previewCursorSizePx;
   const previewCursorHotspotPx = { x: 0, y: 0 };
 
-  const timelineContentWidthPx = useMemo(() => {
+  const timelineVisibleWindowMs = useMemo(() => {
     if (previewDurationMs <= 0) {
-      return Math.max(900, timelineViewportWidthPx || 900);
+      return TIMELINE_MAX_VISIBLE_WINDOW_MS;
     }
-    const scaled = Math.round((previewDurationMs / 1000) * 180 * timelineZoom);
-    return Math.max(timelineViewportWidthPx || 0, scaled, 900);
-  }, [previewDurationMs, timelineViewportWidthPx, timelineZoom]);
+    const fullDurationMs = Math.max(1, Math.round(previewDurationMs));
+    const maxZoomVisibleMs = Math.min(fullDurationMs, TIMELINE_MAX_VISIBLE_WINDOW_MS);
+    if (fullDurationMs <= maxZoomVisibleMs) {
+      return fullDurationMs;
+    }
+
+    const clampedPercent = clamp(
+      timelineZoomPercent,
+      TIMELINE_MIN_ZOOM_PERCENT,
+      TIMELINE_MAX_ZOOM_PERCENT
+    );
+    const progress =
+      (clampedPercent - TIMELINE_MIN_ZOOM_PERCENT) /
+      (TIMELINE_MAX_ZOOM_PERCENT - TIMELINE_MIN_ZOOM_PERCENT);
+    return Math.round(fullDurationMs - (fullDurationMs - maxZoomVisibleMs) * progress);
+  }, [previewDurationMs, timelineZoomPercent]);
+
+  const timelineContentWidthPx = useMemo(() => {
+    const viewportWidthPx = Math.max(1, timelineViewportWidthPx || 900);
+    if (previewDurationMs <= 0) {
+      return viewportWidthPx;
+    }
+    const visibleWindowMs = clamp(timelineVisibleWindowMs, 1, previewDurationMs);
+    const scaled = Math.round((previewDurationMs / visibleWindowMs) * viewportWidthPx);
+    return Math.max(viewportWidthPx, scaled);
+  }, [previewDurationMs, timelineViewportWidthPx, timelineVisibleWindowMs]);
 
   const pxPerPreviewMs = timelineContentWidthPx / Math.max(previewDurationMs, 1);
 
@@ -1139,7 +1203,7 @@ export default function EditScreen() {
       playheadRef.current = 0;
       playheadStateRef.current = 0;
       setPlayheadMs(0);
-      setTimelineZoom(1);
+      setTimelineZoomPercent(TIMELINE_DEFAULT_ZOOM_PERCENT);
       setVideoDurationMs(null);
       setIsVideoPlaying(false);
       setLoadedProjectPath(projectPath);
@@ -1190,9 +1254,9 @@ export default function EditScreen() {
 
     const resolveVideoSrc = async () => {
       const preferredVideoPath =
-        project?.proxyVideoPath?.trim() && project.proxyVideoPath.trim().length > 0
-          ? project.proxyVideoPath.trim()
-          : project?.videoPath?.trim() ?? "";
+        project?.videoPath?.trim() && project.videoPath.trim().length > 0
+          ? project.videoPath.trim()
+          : project?.proxyVideoPath?.trim() ?? "";
 
       if (!project || !loadedProjectPath || !preferredVideoPath) {
         setVideoSrc(null);
@@ -1227,6 +1291,16 @@ export default function EditScreen() {
       isCancelled = true;
     };
   }, [project?.proxyVideoPath, project?.videoPath, loadedProjectPath]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+    const clampedVolume = clamp(previewVolume, 0, 1);
+    video.volume = clampedVolume;
+    video.muted = clampedVolume <= 0.001;
+  }, [previewVolume, videoSrc]);
 
   useEffect(() => {
     playheadStateRef.current = playheadMs;
@@ -1568,6 +1642,10 @@ export default function EditScreen() {
       return;
     }
 
+    const clampedVolume = clamp(previewVolume, 0, 1);
+    video.volume = clampedVolume;
+    video.muted = clampedVolume <= 0.001;
+
     if (video.paused || video.ended) {
       try {
         await video.play();
@@ -1619,6 +1697,8 @@ export default function EditScreen() {
     const nextMs = Math.round((localX / Math.max(rect.width, 1)) * previewDurationMs);
     seekToPreviewMs(nextMs);
   };
+
+  const previewVolumePercent = Math.round(clamp(previewVolume, 0, 1) * 100);
 
   return (
     <div className="edit-shell">
@@ -1868,6 +1948,8 @@ export default function EditScreen() {
                         className="preview-video"
                         src={videoSrc}
                         preload="metadata"
+                        playsInline
+                        muted={previewVolume <= 0.001}
                         onPlay={(event) => {
                           playbackClockRef.current = {
                             anchorPerfMs: performance.now(),
@@ -1972,6 +2054,23 @@ export default function EditScreen() {
                     <SeekForwardIcon />
                   </button>
                 </div>
+                <div className="preview-volume-row">
+                  <span className="preview-volume-icon" aria-hidden="true">
+                    <VolumeIcon muted={previewVolumePercent === 0} />
+                  </span>
+                  <input
+                    type="range"
+                    className="preview-volume-slider"
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={previewVolume}
+                    onChange={(event) => setPreviewVolume(Number(event.target.value))}
+                    aria-label="Preview volume"
+                    disabled={!videoSrc}
+                  />
+                  <span className="preview-volume-value mono">{previewVolumePercent}%</span>
+                </div>
                 <span className="preview-time">
                   {formatMs(playheadMs)} / {formatMs(previewDurationMs)}
                 </span>
@@ -1990,11 +2089,11 @@ export default function EditScreen() {
                 <span>Timeline Zoom</span>
                 <input
                   type="range"
-                  min={1}
-                  max={6}
-                  step={0.1}
-                  value={timelineZoom}
-                  onChange={(event) => setTimelineZoom(Number(event.target.value))}
+                  min={TIMELINE_MIN_ZOOM_PERCENT}
+                  max={TIMELINE_MAX_ZOOM_PERCENT}
+                  step={1}
+                  value={timelineZoomPercent}
+                  onChange={(event) => setTimelineZoomPercent(Number(event.target.value))}
                 />
               </div>
             </div>

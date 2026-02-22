@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
+use rfd::FileDialog;
 use serde::Serialize;
 
 use crate::algorithm::cursor_smoothing::smooth_cursor_path;
@@ -138,6 +139,27 @@ pub async fn reset_export_status(state: tauri::State<'_, ExportState>) -> Result
     }
     *status = ExportStatus::default();
     Ok(())
+}
+
+#[tauri::command]
+pub async fn pick_export_folder(initial_dir: Option<String>) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut dialog = FileDialog::new();
+        if let Some(raw) = initial_dir {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                let candidate = PathBuf::from(trimmed);
+                if candidate.exists() {
+                    dialog = dialog.set_directory(candidate);
+                }
+            }
+        }
+        Ok(dialog
+            .pick_folder()
+            .map(|path| path.to_string_lossy().to_string()))
+    })
+    .await
+    .map_err(|e| format!("Failed to open folder dialog: {e}"))?
 }
 
 #[tauri::command]
@@ -360,7 +382,8 @@ fn execute_ffmpeg_export(
         .arg(&filter_script_path)
         .arg("-map")
         .arg("[vout]")
-        .arg("-an");
+        .arg("-map")
+        .arg("0:a?");
 
     match codec {
         "h264" => {
@@ -401,6 +424,8 @@ fn execute_ffmpeg_export(
             return Err(format!("Unsupported codec: {codec}"));
         }
     };
+
+    command.arg("-c:a").arg("aac").arg("-b:a").arg("192k");
 
     let mut child = command
         .arg(output_video)

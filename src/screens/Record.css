@@ -74,6 +74,11 @@
   opacity: 0.6;
 }
 
+.record-field-error {
+  color: var(--danger-600);
+  font-size: 11px;
+}
+
 .record-field--fps {
   gap: 9px;
 }

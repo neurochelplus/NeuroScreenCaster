@@ -30,14 +30,16 @@
   width: 34px;
   height: 34px;
   border-radius: 10px;
-  display: grid;
-  place-items: center;
-  font-family: "Outfit", "Work Sans", sans-serif;
-  font-size: 13px;
-  font-weight: 700;
-  color: #fff;
-  background: linear-gradient(155deg, var(--primary-500), var(--primary-600));
-  box-shadow: 0 8px 18px rgba(30, 64, 175, 0.25);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: #fff;
+}
+
+.nav-brand-mark-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .nav-brand-copy {

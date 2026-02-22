@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { join } from "@tauri-apps/api/path";
 import type { Project } from "../types/project";
 import "./Export.css";
 
@@ -53,6 +54,21 @@ function formatMs(ms: number): string {
   return `${min}:${sec}`;
 }
 
+function sanitizeFileName(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+  return trimmed.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
+}
+
+function ensureMp4Extension(fileName: string): string {
+  if (fileName.toLowerCase().endsWith(".mp4")) {
+    return fileName;
+  }
+  return `${fileName}.mp4`;
+}
+
 export default function ExportScreen() {
   const [projects, setProjects] = useState<ProjectListItem[]>([]);
   const [selectedProjectPath, setSelectedProjectPath] = useState<string>("");
@@ -61,6 +77,8 @@ export default function ExportScreen() {
   const [height, setHeight] = useState(1080);
   const [fps, setFps] = useState(30);
   const [codec, setCodec] = useState<(typeof CODEC_OPTIONS)[number]>("h264");
+  const [outputDirectory, setOutputDirectory] = useState("");
+  const [outputFileName, setOutputFileName] = useState("");
   const [status, setStatus] = useState<ExportStatus>(DEFAULT_STATUS);
   const [isRefreshingProjects, setIsRefreshingProjects] = useState(false);
   const [isLoadingProject, setIsLoadingProject] = useState(false);
@@ -90,6 +108,8 @@ export default function ExportScreen() {
         const latest = listed[0];
         setSelectedProjectPath(latest.projectPath);
         setSelectedProjectName(latest.name);
+        setOutputDirectory(latest.folderPath);
+        setOutputFileName(ensureMp4Extension(sanitizeFileName(latest.name) || "export"));
       }
     } catch (err) {
       setError(String(err));
@@ -107,6 +127,14 @@ export default function ExportScreen() {
     try {
       const loaded = await invoke<Project>("get_project", { projectPath });
       setSelectedProjectName(loaded.name);
+      setOutputFileName((current) => {
+        const sanitized = sanitizeFileName(loaded.name) || sanitizeFileName(selectedProjectName) || "export";
+        const normalized = ensureMp4Extension(sanitized);
+        if (!current.trim()) {
+          return normalized;
+        }
+        return current;
+      });
       setWidth(loaded.settings.export.width);
       setHeight(loaded.settings.export.height);
       setFps(loaded.settings.export.fps);
@@ -175,17 +203,28 @@ export default function ExportScreen() {
       setError("Select project for export.");
       return;
     }
+    const sanitizedName = sanitizeFileName(outputFileName);
+    if (!outputDirectory.trim()) {
+      setError("Select output folder.");
+      return;
+    }
+    if (!sanitizedName) {
+      setError("Enter export file name.");
+      return;
+    }
 
     setError(null);
     setInfo(null);
     setIsStartingExport(true);
     try {
+      const fullOutputPath = await join(outputDirectory, ensureMp4Extension(sanitizedName));
       await invoke("start_export", {
         projectPath: selectedProjectPath,
         width,
         height,
         fps,
         codec,
+        outputPath: fullOutputPath,
       });
       setInfo("Export started.");
       await fetchStatus();
@@ -193,6 +232,28 @@ export default function ExportScreen() {
       setError(String(err));
     } finally {
       setIsStartingExport(false);
+    }
+  };
+
+  const handleProjectSelection = (projectPath: string) => {
+    setSelectedProjectPath(projectPath);
+    const found = projects.find((item) => item.projectPath === projectPath);
+    if (found && !outputDirectory.trim()) {
+      setOutputDirectory(found.folderPath);
+    }
+  };
+
+  const handlePickOutputDirectory = async () => {
+    setError(null);
+    try {
+      const selected = await invoke<string | null>("pick_export_folder", {
+        initialDir: outputDirectory || null,
+      });
+      if (selected) {
+        setOutputDirectory(selected);
+      }
+    } catch (err) {
+      setError(String(err));
     }
   };
 
@@ -236,7 +297,7 @@ export default function ExportScreen() {
               <span>Selected Recording</span>
               <select
                 value={selectedProjectPath}
-                onChange={(event) => setSelectedProjectPath(event.target.value)}
+                onChange={(event) => handleProjectSelection(event.target.value)}
                 disabled={isLoadingProject || projects.length === 0}
               >
                 {projects.length === 0 ? (
@@ -297,6 +358,33 @@ export default function ExportScreen() {
                     </option>
                   ))}
                 </select>
+              </label>
+            </div>
+
+            <div className="export-output-section">
+              <label className="export-field">
+                <span>Output Folder</span>
+                <div className="export-folder-row">
+                  <input
+                    type="text"
+                    value={outputDirectory}
+                    onChange={(event) => setOutputDirectory(event.target.value)}
+                    placeholder="D:\\Videos\\Exports"
+                  />
+                  <button className="btn-ghost" type="button" onClick={() => void handlePickOutputDirectory()}>
+                    Browse
+                  </button>
+                </div>
+              </label>
+
+              <label className="export-field">
+                <span>File Name</span>
+                <input
+                  type="text"
+                  value={outputFileName}
+                  onChange={(event) => setOutputFileName(event.target.value)}
+                  placeholder="my-recording.mp4"
+                />
               </label>
             </div>
 

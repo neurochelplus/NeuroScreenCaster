@@ -18,6 +18,34 @@ pub enum AutoZoomTriggerMode {
     CtrlClick,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecordingAudioMode {
+    #[default]
+    NoAudio,
+    SystemOnly,
+    MicrophoneOnly,
+    MicrophoneAndSystem,
+}
+
+pub enum AudioCaptureBackend {
+    FfmpegChild(std::process::Child),
+    NativeLoopback {
+        stop_flag: Arc<AtomicBool>,
+        join_handle: std::thread::JoinHandle<Result<(), String>>,
+    },
+}
+
+pub struct AudioCaptureProcess {
+    pub backend: AudioCaptureBackend,
+    pub output_path: PathBuf,
+}
+
+pub struct AudioCaptureSession {
+    pub system_capture: Option<AudioCaptureProcess>,
+    pub microphone_capture: Option<AudioCaptureProcess>,
+}
+
 /// Data for one active recording session.
 pub struct ActiveRecording {
     pub recording_id: String,
@@ -40,6 +68,12 @@ pub struct ActiveRecording {
     pub pause_ranges_ms: Vec<(u64, u64)>,
     /// Auto-zoom activation mode selected before recording start.
     pub auto_zoom_trigger_mode: AutoZoomTriggerMode,
+    /// Audio capture mode selected before recording start.
+    pub audio_mode: RecordingAudioMode,
+    /// Selected microphone input device name (if required by mode).
+    pub microphone_device: Option<String>,
+    /// Optional live audio capture session.
+    pub audio_capture_session: Option<AudioCaptureSession>,
     /// Telemetry processor thread (returns all collected events on join).
     pub telemetry_processor: std::thread::JoinHandle<Vec<InputEvent>>,
 }

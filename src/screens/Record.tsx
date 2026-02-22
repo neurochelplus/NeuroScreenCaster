@@ -16,11 +16,18 @@ type RecordState = OverlayRecordingState;
 type AutoZoomTriggerMode = "single-click" | "multi-click-window" | "ctrl-click";
 type RecordingQuality = "low" | "balanced" | "high";
 type RecordingFps = 30 | 60;
+type RecordingAudioMode =
+  | "no-audio"
+  | "system-only"
+  | "microphone-only"
+  | "microphone-and-system";
 
 interface StartRecordingOptions {
   autoZoomTriggerMode: AutoZoomTriggerMode;
   quality: RecordingQuality;
   targetFps: RecordingFps;
+  audioCaptureMode: RecordingAudioMode;
+  microphoneDevice?: string;
 }
 
 interface NativePreviewFrame {
@@ -75,6 +82,11 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
   const [autoZoomTriggerMode, setAutoZoomTriggerMode] = useState<AutoZoomTriggerMode>("single-click");
   const [recordingQuality, setRecordingQuality] = useState<RecordingQuality>("high");
   const [recordingFps, setRecordingFps] = useState<RecordingFps>(60);
+  const [audioCaptureMode, setAudioCaptureMode] = useState<RecordingAudioMode>("no-audio");
+  const [microphoneDevices, setMicrophoneDevices] = useState<string[]>([]);
+  const [selectedMicrophoneDevice, setSelectedMicrophoneDevice] = useState("");
+  const [isLoadingMicrophones, setIsLoadingMicrophones] = useState(false);
+  const [microphoneError, setMicrophoneError] = useState<string | null>(null);
 
   const tickerRef = useRef<number | null>(null);
   const elapsedBeforePauseMsRef = useRef(0);
@@ -334,6 +346,46 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
   }, [isActive, startPreview, state, stopPreview]);
 
   useEffect(() => {
+    if (!isActive) {
+      return;
+    }
+
+    let cancelled = false;
+    const loadMicrophones = async () => {
+      setIsLoadingMicrophones(true);
+      setMicrophoneError(null);
+      try {
+        const devices = await invoke<string[]>("list_audio_input_devices");
+        if (cancelled) {
+          return;
+        }
+        setMicrophoneDevices(devices);
+        setSelectedMicrophoneDevice((current) => {
+          if (current && devices.includes(current)) {
+            return current;
+          }
+          return devices[0] ?? "";
+        });
+      } catch (err) {
+        if (!cancelled) {
+          setMicrophoneError(String(err));
+          setMicrophoneDevices([]);
+          setSelectedMicrophoneDevice("");
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingMicrophones(false);
+        }
+      }
+    };
+
+    void loadMicrophones();
+    return () => {
+      cancelled = true;
+    };
+  }, [isActive]);
+
+  useEffect(() => {
     if (state === "idle") {
       stopCtrlPolling();
       setIsCtrlPressed(false);
@@ -381,6 +433,16 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
     setDuration(0);
     elapsedBeforePauseMsRef.current = 0;
     resumedAtMsRef.current = null;
+    const requiresMicrophone =
+      audioCaptureMode === "microphone-only" || audioCaptureMode === "microphone-and-system";
+    const microphoneDeviceForStart = requiresMicrophone && selectedMicrophoneDevice
+      ? selectedMicrophoneDevice
+      : undefined;
+
+    if (requiresMicrophone && !microphoneDeviceForStart) {
+      setError("Select microphone device before recording.");
+      return;
+    }
 
     try {
       await stopPreview();
@@ -388,6 +450,8 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
         autoZoomTriggerMode,
         quality: recordingQuality,
         targetFps: recordingFps,
+        audioCaptureMode,
+        microphoneDevice: microphoneDeviceForStart,
       };
       const id = await invoke<string>("start_recording", { monitorIndex: 0, options });
       setRecordingId(id);
@@ -405,9 +469,11 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
     }
   }, [
     autoZoomTriggerMode,
+    audioCaptureMode,
     finalizeElapsedBeforePause,
     recordingFps,
     recordingQuality,
+    selectedMicrophoneDevice,
     stopPreview,
     startTicker,
   ]);
@@ -490,6 +556,8 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
   }, [handlePause, handleResume, handleStop]);
 
   const isIdle = state === "idle";
+  const microphoneSelectionVisible =
+    audioCaptureMode === "microphone-only" || audioCaptureMode === "microphone-and-system";
   const statusText =
     state === "idle"
       ? "Ready to record"
@@ -534,6 +602,44 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
                 <option value="high">High</option>
               </select>
             </label>
+
+            <label className="record-field">
+              <span className="record-field-label">Audio Source</span>
+              <select
+                value={audioCaptureMode}
+                onChange={(event) => setAudioCaptureMode(event.target.value as RecordingAudioMode)}
+                disabled={!isIdle}
+              >
+                <option value="system-only">Only system audio</option>
+                <option value="microphone-only">Only microphone</option>
+                <option value="microphone-and-system">Microphone and system audio</option>
+                <option value="no-audio">No audio</option>
+              </select>
+            </label>
+
+            {microphoneSelectionVisible && (
+              <label className="record-field">
+                <span className="record-field-label">Microphone Device</span>
+                <select
+                  value={selectedMicrophoneDevice}
+                  onChange={(event) => setSelectedMicrophoneDevice(event.target.value)}
+                  disabled={!isIdle || isLoadingMicrophones || microphoneDevices.length === 0}
+                >
+                  {microphoneDevices.length === 0 ? (
+                    <option value="">
+                      {isLoadingMicrophones ? "Loading devices..." : "No microphone devices found"}
+                    </option>
+                  ) : (
+                    microphoneDevices.map((device) => (
+                      <option key={device} value={device}>
+                        {device}
+                      </option>
+                    ))
+                  )}
+                </select>
+                {microphoneError && <small className="record-field-error">{microphoneError}</small>}
+              </label>
+            )}
           </section>
 
           <section className="record-settings-group">

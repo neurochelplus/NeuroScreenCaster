@@ -126,6 +126,21 @@
   gap: 10px;
 }
 
+.export-output-section {
+  display: grid;
+  gap: 10px;
+}
+
+.export-folder-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.export-folder-row .btn-ghost {
+  min-height: 38px;
+}
+
 .export-actions {
   display: flex;
   align-items: center;
