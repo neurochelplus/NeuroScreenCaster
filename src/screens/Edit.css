@@ -52,15 +52,18 @@
   border-radius: 14px;
   padding: 10px 12px;
   display: flex;
-  align-items: end;
-  justify-content: space-between;
+  align-items: center;
+  justify-content: flex-start;
   gap: 12px;
+  align-self: flex-start;
+  width: min(620px, 100%);
 }
 
 .project-picker {
   display: grid;
   gap: 6px;
-  min-width: min(680px, 100%);
+  min-width: 0;
+  width: min(560px, 100%);
   flex: 1;
 }
 
@@ -91,6 +94,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  margin-left: auto;
 }
 
 .project-meta {
@@ -146,7 +150,7 @@
 
 .editor-main {
   display: grid;
-  grid-template-columns: minmax(250px, 30%) minmax(0, 70%);
+  grid-template-columns: minmax(220px, 24%) minmax(0, 76%);
   gap: 12px;
   flex: 1;
   min-height: 0;
@@ -167,6 +171,24 @@
   align-content: start;
   gap: 14px;
   overflow: auto;
+}
+
+.sidebar-project-toolbar {
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+  background: #fbfcff;
+}
+
+.sidebar-project-toolbar .project-picker {
+  width: 100%;
+}
+
+.sidebar-project-toolbar .toolbar-actions {
+  margin-left: 0;
+  justify-content: flex-end;
 }
 
 .sidebar-header {
@@ -297,13 +319,19 @@
   position: absolute;
   top: 0;
   left: 0;
-  border-radius: 999px;
-  border: 2px solid rgba(0, 0, 0, 0.45);
-  transform: translate3d(-9999px, -9999px, 0) translate(-50%, -50%);
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.35);
+  transform: translate3d(-9999px, -9999px, 0);
+  background-position: top left;
+  background-repeat: no-repeat;
+  background-size: contain;
+  filter: none;
   pointer-events: none;
+  transform-origin: top left;
   will-change: transform, width, height;
-  transition: width 120ms ease, height 120ms ease;
+}
+
+.preview-cursor--vector {
+  clip-path: none;
+  image-rendering: auto;
 }
 
 .preview-controls {

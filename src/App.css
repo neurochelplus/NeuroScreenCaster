@@ -9,3 +9,11 @@
   overflow: auto;
   padding: 24px;
 }
+
+.screen-pane {
+  height: 100%;
+}
+
+.screen-pane--hidden {
+  display: none;
+}

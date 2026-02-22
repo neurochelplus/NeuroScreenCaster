@@ -3,6 +3,13 @@ use crate::models::project::{
     CameraSpring, NormalizedRect, TargetPoint, ZoomMode, ZoomSegment, ZoomTrigger,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickActivationMode {
+    SingleClick,
+    MultiClickWindow,
+    CtrlClick,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum CameraState {
     FreeRoam,
@@ -81,6 +88,7 @@ pub struct SmartCameraConfig {
     pub safe_zone_margin_ratio: f64,
     pub max_lookahead_ms: u64,
     pub velocity_threshold_px_per_ms: f64,
+    pub click_activation_mode: ClickActivationMode,
     pub activation_window_ms: u64,
     pub min_clicks_to_activate: usize,
     pub click_cluster_gap_ms: u64,
@@ -111,16 +119,17 @@ impl Default for SmartCameraConfig {
             semantic_padding_ratio: 0.20,
             fallback_zoom: 2.0,
             free_roam_zoom: 1.0,
-            max_zoom_limit: 2.5,
+            max_zoom_limit: 2.0,
             safe_zone_margin_ratio: 0.15,
             max_lookahead_ms: 400,
             velocity_threshold_px_per_ms: 0.55,
+            click_activation_mode: ClickActivationMode::MultiClickWindow,
             activation_window_ms: 3_000,
             min_clicks_to_activate: 2,
             click_cluster_gap_ms: 300,
             min_zoom_interval_ms: 2_000,
-            min_lock_duration_ms: 1_800,
-            lock_recent_window_ms: 2_200,
+            min_lock_duration_ms: 0,
+            lock_recent_window_ms: 2_000,
             spring_mass: mass,
             spring_stiffness: stiffness,
             spring_damping: damping,
@@ -191,6 +200,7 @@ struct FocusClick {
     x: f64,
     y: f64,
     bounds: Option<RectPx>,
+    ctrl_pressed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -672,12 +682,7 @@ fn build_focus_transitions(
         return Vec::new();
     }
 
-    let gated_clicks = filter_clicks_by_activation_window(
-        &clicks,
-        config.activation_window_ms.max(1),
-        config.min_clicks_to_activate.max(1),
-        config.click_cluster_gap_ms.max(1),
-    );
+    let gated_clicks = filter_clicks_by_activation_mode(&clicks, config);
     if gated_clicks.is_empty() {
         return Vec::new();
     }
@@ -729,34 +734,63 @@ fn build_focus_transitions(
 }
 
 fn collect_focus_clicks(events: &[InputEvent]) -> Vec<FocusClick> {
-    let mut clicks = events
-        .iter()
-        .filter_map(|event| {
-            if let InputEvent::Click {
+    let mut sorted_events = events.iter().collect::<Vec<_>>();
+    sorted_events.sort_by_key(|event| event.ts());
+
+    let mut clicks = Vec::new();
+    let mut ctrl_pressed = false;
+    for event in sorted_events {
+        match event {
+            InputEvent::KeyDown { key_code, .. } if is_ctrl_key_code(key_code) => {
+                ctrl_pressed = true;
+            }
+            InputEvent::KeyUp { key_code, .. } if is_ctrl_key_code(key_code) => {
+                ctrl_pressed = false;
+            }
+            InputEvent::Click {
                 ts,
                 x,
                 y,
                 ui_context,
                 ..
-            } = event
-            {
+            } => {
                 let bounds = ui_context
                     .as_ref()
                     .and_then(|ctx| ctx.bounding_rect.as_ref())
                     .and_then(rect_from_bounds);
-                return Some(FocusClick {
+                clicks.push(FocusClick {
                     ts: *ts,
                     x: *x,
                     y: *y,
                     bounds,
+                    ctrl_pressed,
                 });
             }
-            None
-        })
-        .collect::<Vec<_>>();
+            _ => {}
+        }
+    }
 
-    clicks.sort_by_key(|click| click.ts);
     clicks
+}
+
+fn filter_clicks_by_activation_mode(
+    clicks: &[FocusClick],
+    config: &SmartCameraConfig,
+) -> Vec<FocusClick> {
+    match config.click_activation_mode {
+        ClickActivationMode::SingleClick => clicks.to_vec(),
+        ClickActivationMode::CtrlClick => clicks
+            .iter()
+            .copied()
+            .filter(|click| click.ctrl_pressed)
+            .collect(),
+        ClickActivationMode::MultiClickWindow => filter_clicks_by_activation_window(
+            clicks,
+            config.activation_window_ms.max(1),
+            config.min_clicks_to_activate.max(1),
+            config.click_cluster_gap_ms.max(1),
+        ),
+    }
 }
 
 fn filter_clicks_by_activation_window(
@@ -1222,6 +1256,15 @@ fn normalize_scroll_delta(delta: f64) -> f64 {
     }
 }
 
+fn is_ctrl_key_code(key_code: &str) -> bool {
+    let normalized = key_code.trim().to_ascii_lowercase();
+    normalized == "ctrl"
+        || normalized == "control"
+        || normalized == "controlleft"
+        || normalized == "controlright"
+        || normalized.contains("control")
+}
+
 fn rect_from_bounds(bounds: &BoundingRect) -> Option<RectPx> {
     if bounds.width == 0 || bounds.height == 0 {
         return None;
@@ -1296,7 +1339,7 @@ mod tests {
             .expect("expected locked sample");
         assert!((locked.target_center_x - ((400.0 + 120.0) / 1_920.0)).abs() < 0.01);
         assert!((locked.target_center_y - ((200.0 + 60.0) / 1_080.0)).abs() < 0.01);
-        assert!(locked.target_zoom > 2.0);
+        assert!((locked.target_zoom - cfg.max_zoom_limit).abs() < 0.001);
     }
 
     #[test]
@@ -1371,7 +1414,11 @@ mod tests {
             ..SmartCameraConfig::default()
         };
         let segments = build_smart_camera_segments(&events, 1_920, 1_080, 3_000, 16.0 / 9.0, &cfg);
-        assert_eq!(segments.len(), 1, "expected only one effective auto-zoom segment");
+        assert_eq!(
+            segments.len(),
+            1,
+            "expected only one effective auto-zoom segment"
+        );
         let segment = &segments[0];
         assert!(
             segment.start_ts >= 1_600,
@@ -1379,7 +1426,10 @@ mod tests {
             segment.start_ts
         );
         assert!(
-            segment.target_points.iter().any(|point| point.rect.width < 0.99),
+            segment
+                .target_points
+                .iter()
+                .any(|point| point.rect.width < 0.99),
             "segment must contain actual zoom-in target points"
         );
         assert_eq!(segment.mode, ZoomMode::FollowCursor);
@@ -1408,6 +1458,34 @@ mod tests {
             track.iter().any(|sample| sample.state.is_locked()),
             "expected locked samples for 2 clicks inside 3s activation window"
         );
+    }
+
+    #[test]
+    fn ctrl_click_mode_requires_ctrl_pressed() {
+        let events = vec![
+            click_with_bounds(1_000, 960.0, 540.0, None),
+            InputEvent::KeyDown {
+                ts: 1_400,
+                key_code: "ControlLeft".to_string(),
+            },
+            click_with_bounds(1_500, 960.0, 540.0, None),
+            InputEvent::KeyUp {
+                ts: 1_650,
+                key_code: "ControlLeft".to_string(),
+            },
+        ];
+        let cfg = SmartCameraConfig {
+            click_activation_mode: ClickActivationMode::CtrlClick,
+            min_clicks_to_activate: 1,
+            ..SmartCameraConfig::default()
+        };
+        let track = process_camera_targets(&events, 1_920, 1_080, 2_400, 16.0 / 9.0, &cfg);
+        let first_locked_ts = track
+            .iter()
+            .find(|sample| sample.state.is_locked())
+            .map(|sample| sample.ts)
+            .expect("expected locked sample");
+        assert!(first_locked_ts >= 1_500);
     }
 
     #[test]

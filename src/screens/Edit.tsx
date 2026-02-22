@@ -82,6 +82,15 @@ const FOLLOW_DEAD_ZONE_RATIO = 0.2;
 const FOLLOW_HARD_EDGE_RATIO = 0.35;
 const FOLLOW_MAX_SPEED_PX_PER_S = 800;
 const EFFECTIVE_ZOOM_EPSILON = 0.001;
+const CURSOR_SIZE_TO_FRAME_RATIO = 0.03;
+const CLICK_PULSE_MIN_SCALE = 0.82;
+const CLICK_PULSE_TOTAL_MS = 150;
+const CLICK_PULSE_DOWN_MS = 65;
+const VECTOR_CURSOR_WIDTH = 72;
+const VECTOR_CURSOR_HEIGHT = 110;
+const VECTOR_CURSOR_DATA_URI = `data:image/svg+xml;utf8,${encodeURIComponent(
+  "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 72 110'><path d='M0 0 L0 90 L22 70 L35 110 L50 102 L38 63 L72 63 Z' fill='#000000' stroke='#ffffff' stroke-width='6' stroke-linejoin='round'/></svg>"
+)}`;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -530,6 +539,58 @@ function extractCursorSamples(eventsFile: EventsFile | null, smoothingFactor: nu
   return smoothed;
 }
 
+function extractClickTimestamps(eventsFile: EventsFile | null): number[] {
+  if (!eventsFile) {
+    return [];
+  }
+  const clicks: number[] = [];
+  for (const event of eventsFile.events) {
+    if (event.type === "click") {
+      clicks.push(event.ts);
+    }
+  }
+  clicks.sort((a, b) => a - b);
+  return clicks;
+}
+
+function sampleClickPulseScale(clickTimestamps: number[], ts: number): number {
+  if (clickTimestamps.length === 0) {
+    return 1;
+  }
+
+  let low = 0;
+  let high = clickTimestamps.length - 1;
+  let nearestIndex = -1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const clickTs = clickTimestamps[mid];
+    if (clickTs <= ts) {
+      nearestIndex = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  if (nearestIndex < 0) {
+    return 1;
+  }
+
+  const dt = ts - clickTimestamps[nearestIndex];
+  if (dt < 0 || dt > CLICK_PULSE_TOTAL_MS) {
+    return 1;
+  }
+
+  if (dt <= CLICK_PULSE_DOWN_MS) {
+    const t = dt / CLICK_PULSE_DOWN_MS;
+    return 1 - (1 - CLICK_PULSE_MIN_SCALE) * t;
+  }
+
+  const upDuration = Math.max(1, CLICK_PULSE_TOTAL_MS - CLICK_PULSE_DOWN_MS);
+  const t = (dt - CLICK_PULSE_DOWN_MS) / upDuration;
+  return CLICK_PULSE_MIN_SCALE + (1 - CLICK_PULSE_MIN_SCALE) * t;
+}
+
 function interpolateCursor(samples: CursorSample[], ts: number): { x: number; y: number } {
   if (samples.length === 0) {
     return { x: 0.5, y: 0.5 };
@@ -758,7 +819,6 @@ export default function EditScreen() {
   const [error, setError] = useState<string | null>(null);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [eventsError, setEventsError] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const previewStageRef = useRef<HTMLDivElement | null>(null);
@@ -810,6 +870,20 @@ export default function EditScreen() {
   }, [previewStageSize.width, previewStageSize.height, previewAspectRatio]);
 
   const hasPreviewFrame = previewFrameSize.width > 1 && previewFrameSize.height > 1;
+  const previewCursorSizePx = useMemo(() => {
+    if (!project) {
+      return 12;
+    }
+    const minSide = Math.max(1, Math.min(previewFrameSize.width, previewFrameSize.height));
+    return clamp(project.settings.cursor.size * minSide * CURSOR_SIZE_TO_FRAME_RATIO, 8, 280);
+  }, [previewFrameSize.height, previewFrameSize.width, project]);
+  const previewCursorAspect = VECTOR_CURSOR_WIDTH / VECTOR_CURSOR_HEIGHT;
+  const previewCursorWidthPx = useMemo(
+    () => Math.max(4, previewCursorSizePx * previewCursorAspect),
+    [previewCursorAspect, previewCursorSizePx]
+  );
+  const previewCursorHeightPx = previewCursorSizePx;
+  const previewCursorHotspotPx = { x: 0, y: 0 };
 
   const timelineContentWidthPx = useMemo(() => {
     if (previewDurationMs <= 0) {
@@ -829,6 +903,7 @@ export default function EditScreen() {
     () => extractCursorSamples(eventsFile, project?.settings.cursor.smoothingFactor ?? 0.8),
     [eventsFile, project?.settings.cursor.smoothingFactor]
   );
+  const clickTimestamps = useMemo(() => extractClickTimestamps(eventsFile), [eventsFile]);
   const runtimeSegments = useMemo(
     () =>
       toRuntimeSegments(
@@ -907,9 +982,13 @@ export default function EditScreen() {
         const cursorVideoY = cursor.y * previewFrameSize.height;
         const cursorX = cursorVideoX * scale + txPx;
         const cursorY = cursorVideoY * scale + tyPx;
-        cursorRef.current.style.transform = `translate3d(${cursorX.toFixed(
+        const cursorPulseScale = sampleClickPulseScale(clickTimestamps, timelineMs);
+        const cursorScale = Math.max(0.25, scale) * cursorPulseScale;
+        const topLeftX = cursorX - previewCursorHotspotPx.x;
+        const topLeftY = cursorY - previewCursorHotspotPx.y;
+        cursorRef.current.style.transform = `translate3d(${topLeftX.toFixed(
           3
-        )}px, ${cursorY.toFixed(3)}px, 0) translate(-50%, -50%)`;
+        )}px, ${topLeftY.toFixed(3)}px, 0) scale(${cursorScale.toFixed(4)})`;
       }
 
       if (timelinePlayheadRef.current) {
@@ -920,11 +999,14 @@ export default function EditScreen() {
       }
     },
     [
+      clickTimestamps,
       cursorSamples,
       previewCameraTrack,
       previewDurationMs,
       previewFrameSize.height,
       previewFrameSize.width,
+      previewCursorHotspotPx.x,
+      previewCursorHotspotPx.y,
       pxPerPreviewMs,
       timelineContentWidthPx,
       timelineDurationMs,
@@ -993,13 +1075,10 @@ export default function EditScreen() {
     }));
   };
 
-  const loadProjectByPath = async (projectPath: string, showLoadedInfo = true) => {
+  const loadProjectByPath = async (projectPath: string, _showLoadedInfo = true) => {
     setError(null);
     setVideoError(null);
     setEventsError(null);
-    if (showLoadedInfo) {
-      setInfo(null);
-    }
     setIsLoadingProject(true);
 
     try {
@@ -1029,9 +1108,6 @@ export default function EditScreen() {
       setVideoDurationMs(null);
       setIsVideoPlaying(false);
       setLoadedProjectPath(projectPath);
-      if (showLoadedInfo) {
-        setInfo(`Loaded project: ${loaded.name}`);
-      }
     } catch (err) {
       setError(String(err));
       setProject(null);
@@ -1056,14 +1132,12 @@ export default function EditScreen() {
           setLoadedProjectPath(null);
           setSelectedSegmentId(null);
           setVideoDurationMs(null);
-          setInfo("No projects found. Create a recording first.");
         }
         return;
       }
 
       if (autoLoadLatest) {
         await loadProjectByPath(listed[0].projectPath, false);
-        setInfo(`Loaded latest project: ${listed[0].name}`);
       }
     } catch (err) {
       setError(String(err));
@@ -1330,7 +1404,6 @@ export default function EditScreen() {
       return;
     }
     setError(null);
-    setInfo(null);
     setIsSaving(true);
     try {
       const runtimeById = new Map(runtimeSegments.map((segment) => [segment.id, segment]));
@@ -1364,7 +1437,6 @@ export default function EditScreen() {
       setProject(projectForSave);
       setLoadedProjectPath(savedPath);
       await refreshProjects(false);
-      setInfo(`Project saved: ${savedPath}`);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -1515,65 +1587,93 @@ export default function EditScreen() {
 
   return (
     <div className="edit-shell">
-      <section className="editor-toolbar">
-        <div className="project-picker">
-          <label htmlFor="project-select">Project</label>
-          <select
-            id="project-select"
-            value={loadedProjectPath ?? ""}
-            onChange={(event) => void loadProjectByPath(event.target.value)}
-            disabled={isLoadingProject || projects.length === 0}
-          >
-            {projects.length === 0 ? (
-              <option value="">No projects</option>
-            ) : (
-              projects.map((item) => (
-                <option key={item.projectPath} value={item.projectPath}>
-                  {item.name} | {formatDate(item.createdAt)} | {formatMs(item.durationMs)}
-                </option>
-              ))
-            )}
-          </select>
-        </div>
-
-        <div className="toolbar-actions">
-          <button className="btn-ghost" onClick={() => void refreshProjects(false)} disabled={isRefreshingProjects}>
-            {isRefreshingProjects ? "Refreshing..." : "Refresh"}
-          </button>
-          <button className="btn-primary" onClick={handleSaveProject} disabled={!project || isSaving}>
-            {isSaving ? "Saving..." : "Save"}
-          </button>
-        </div>
-      </section>
-
-      {project && (
-        <div className="project-meta">
-          <span>{project.name}</span>
-          <span>ID: {project.id}</span>
-          <span>Timeline: {formatMs(timelineDurationMs)}</span>
-          <span>Video: {formatMs(previewDurationMs)}</span>
-          <span>
-            Resolution: {project.videoWidth}x{project.videoHeight}
-          </span>
-        </div>
-      )}
-
       {error && <div className="edit-banner edit-banner--error">{error}</div>}
       {videoError && <div className="edit-banner edit-banner--error">{videoError}</div>}
       {eventsError && <div className="edit-banner edit-banner--error">{eventsError}</div>}
-      {info && <div className="edit-banner edit-banner--info">{info}</div>}
 
       {!project && (
-        <section className="editor-empty">
-          <h2>Project is not loaded</h2>
-          <p>Create recording and choose it from dropdown above.</p>
-        </section>
+        <>
+          <section className="editor-toolbar">
+            <div className="project-picker">
+              <label htmlFor="project-select-empty">Project</label>
+              <select
+                id="project-select-empty"
+                value={loadedProjectPath ?? ""}
+                onChange={(event) => void loadProjectByPath(event.target.value)}
+                disabled={isLoadingProject || projects.length === 0}
+              >
+                {projects.length === 0 ? (
+                  <option value="">No projects</option>
+                ) : (
+                  projects.map((item) => (
+                    <option key={item.projectPath} value={item.projectPath}>
+                      {item.name} | {formatDate(item.createdAt)} | {formatMs(item.durationMs)}
+                    </option>
+                  ))
+                )}
+              </select>
+            </div>
+
+            <div className="toolbar-actions">
+              <button
+                className="btn-ghost"
+                onClick={() => void refreshProjects(false)}
+                disabled={isRefreshingProjects}
+              >
+                {isRefreshingProjects ? "Refreshing..." : "Refresh"}
+              </button>
+              <button className="btn-primary" onClick={handleSaveProject} disabled>
+                Save
+              </button>
+            </div>
+          </section>
+
+          <section className="editor-empty">
+            <h2>Project is not loaded</h2>
+            <p>Create recording and choose it from dropdown.</p>
+          </section>
+        </>
       )}
 
       {project && (
         <>
           <section className="editor-main">
             <aside className="editor-sidebar">
+              <section className="sidebar-project-toolbar">
+                <div className="project-picker">
+                  <label htmlFor="project-select">Project</label>
+                  <select
+                    id="project-select"
+                    value={loadedProjectPath ?? ""}
+                    onChange={(event) => void loadProjectByPath(event.target.value)}
+                    disabled={isLoadingProject || projects.length === 0}
+                  >
+                    {projects.length === 0 ? (
+                      <option value="">No projects</option>
+                    ) : (
+                      projects.map((item) => (
+                        <option key={item.projectPath} value={item.projectPath}>
+                          {item.name} | {formatDate(item.createdAt)} | {formatMs(item.durationMs)}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </div>
+
+                <div className="toolbar-actions">
+                  <button
+                    className="btn-ghost"
+                    onClick={() => void refreshProjects(false)}
+                    disabled={isRefreshingProjects}
+                  >
+                    {isRefreshingProjects ? "Refreshing..." : "Refresh"}
+                  </button>
+                  <button className="btn-primary" onClick={handleSaveProject} disabled={!project || isSaving}>
+                    {isSaving ? "Saving..." : "Save"}
+                  </button>
+                </div>
+              </section>
+
               <div className="sidebar-header">
                 <h2>Selected Zoom</h2>
                 <button className="btn-ghost" onClick={handleDeleteSelectedSegment} disabled={!selectedSegment}>
@@ -1799,11 +1899,12 @@ export default function EditScreen() {
                   </div>
                   <div
                     ref={cursorRef}
-                    className="preview-cursor"
+                    className="preview-cursor preview-cursor--vector"
                     style={{
-                      width: `${project.settings.cursor.size * 16}px`,
-                      height: `${project.settings.cursor.size * 16}px`,
-                      background: project.settings.cursor.color,
+                      width: `${previewCursorWidthPx}px`,
+                      height: `${previewCursorHeightPx}px`,
+                      transformOrigin: `${previewCursorHotspotPx.x}px ${previewCursorHotspotPx.y}px`,
+                      backgroundImage: `url("${VECTOR_CURSOR_DATA_URI}")`,
                     }}
                   />
                 </div>

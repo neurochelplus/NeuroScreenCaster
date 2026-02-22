@@ -10,7 +10,8 @@ use serde::Serialize;
 
 use crate::algorithm::cursor_smoothing::smooth_cursor_path;
 use crate::capture::recorder::find_ffmpeg_exe;
-use crate::models::events::{EventsFile, SCHEMA_VERSION as EVENTS_SCHEMA_VERSION};
+use crate::commands::cursor::resolve_cursor_asset_for_render;
+use crate::models::events::{EventsFile, InputEvent, SCHEMA_VERSION as EVENTS_SCHEMA_VERSION};
 use crate::models::project::{
     CameraSpring, NormalizedRect, PanKeyframe, Project, TargetPoint, ZoomSegment, SCHEMA_VERSION,
 };
@@ -18,6 +19,20 @@ use crate::models::project::{
 const DEFAULT_SPRING_MASS: f64 = 1.0;
 const DEFAULT_SPRING_STIFFNESS: f64 = 170.0;
 const DEFAULT_SPRING_DAMPING: f64 = 26.0;
+const CURSOR_SIZE_TO_FRAME_RATIO: f64 = 0.03;
+const CLICK_PULSE_MIN_SCALE: f64 = 0.82;
+const CLICK_PULSE_TOTAL_MS: f64 = 150.0;
+const CLICK_PULSE_DOWN_MS: f64 = 65.0;
+const MAX_CURSOR_SAMPLES_FOR_EXPR: usize = 90;
+const MAX_CLICK_EVENTS_FOR_EXPR: usize = 90;
+const MAX_CAMERA_STATES_FOR_ANALYTIC_EXPR: usize = 64;
+const MAX_CAMERA_POINTS_FOR_EXPR: usize = 480;
+const CAMERA_FALLBACK_SAMPLE_RATE_HZ: f64 = 20.0;
+const MIN_CLICK_PULSE_GAP_MS: u64 = 120;
+const ENABLE_CUSTOM_CURSOR_OVERLAY_EXPORT: bool = false;
+const VECTOR_CURSOR_SAMPLE_FPS: f64 = 18.0;
+const VECTOR_CURSOR_ASS_BASE_HEIGHT: f64 = 112.0;
+const VECTOR_CURSOR_ASS_PATH: &str = "m 0 0 l 0 90 l 22 70 l 35 110 l 50 102 l 38 63 l 72 63 l 0 0";
 
 #[derive(Debug, Clone, Copy)]
 struct SpringParams {
@@ -92,6 +107,12 @@ struct MediaProbe {
     duration_ms: Option<u64>,
     width: Option<u32>,
     height: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct CursorOverlayPlan {
+    cursor_png_path: PathBuf,
+    filter_chain: String,
 }
 
 #[tauri::command]
@@ -259,7 +280,7 @@ fn run_export_job(
         source_height,
     );
 
-    let (filter_graph, cursor_ass_file) = match filter_build {
+    let (filter_graph, cursor_image_input, cursor_temp_file) = match filter_build {
         Ok(result) => result,
         Err(err) => {
             update_status(&status_state, |status| {
@@ -275,13 +296,14 @@ fn run_export_job(
     let result = execute_ffmpeg_export(
         &status_state,
         &source_video,
+        cursor_image_input.as_deref(),
         &output_video,
         &filter_graph,
         &codec,
         source_duration_ms,
     );
 
-    if let Some(path) = cursor_ass_file {
+    if let Some(path) = cursor_temp_file {
         let _ = std::fs::remove_file(path);
     }
 
@@ -306,6 +328,7 @@ fn run_export_job(
 fn execute_ffmpeg_export(
     status_state: &Arc<Mutex<ExportStatus>>,
     source_video: &Path,
+    cursor_image: Option<&Path>,
     output_video: &Path,
     filter_graph: &str,
     codec: &str,
@@ -322,12 +345,21 @@ fn execute_ffmpeg_export(
     let ffmpeg = find_ffmpeg_exe();
 
     let mut command = Command::new(&ffmpeg);
+    command.arg("-y").arg("-i").arg(source_video);
+
+    if let Some(cursor_image_path) = cursor_image {
+        command
+            .arg("-loop")
+            .arg("1")
+            .arg("-i")
+            .arg(cursor_image_path);
+    }
+
     command
-        .arg("-y")
-        .arg("-i")
-        .arg(source_video)
-        .arg("-filter_script:v")
+        .arg("-filter_complex_script")
         .arg(&filter_script_path)
+        .arg("-map")
+        .arg("[vout]")
         .arg("-an");
 
     match codec {
@@ -336,7 +368,7 @@ fn execute_ffmpeg_export(
                 .arg("-c:v")
                 .arg("libx264")
                 .arg("-preset")
-                .arg("medium")
+                .arg("ultrafast")
                 .arg("-crf")
                 .arg("18")
                 .arg("-pix_fmt")
@@ -347,7 +379,7 @@ fn execute_ffmpeg_export(
                 .arg("-c:v")
                 .arg("libx265")
                 .arg("-preset")
-                .arg("medium")
+                .arg("ultrafast")
                 .arg("-crf")
                 .arg("24")
                 .arg("-pix_fmt")
@@ -448,7 +480,7 @@ fn build_export_filter_graph(
     source_duration_ms: u64,
     source_width: u32,
     source_height: u32,
-) -> Result<(String, Option<PathBuf>), String> {
+) -> Result<(String, Option<PathBuf>, Option<PathBuf>), String> {
     let render_fps = target_fps as f64;
     let camera_states = build_camera_states(
         project,
@@ -466,44 +498,87 @@ fn build_export_filter_graph(
         build_camera_value_expr(&camera_states, |state| state.offset_y, 0.0, render_fps);
 
     let mut input_chain: Vec<String> = Vec::new();
-    let mut cursor_ass_file = None;
+    let mut cursor_overlay_filter = None;
+    let mut cursor_input_path = None;
+    let mut cursor_temp_file = None;
 
     // Upsample to target FPS before camera transforms to match preview smoothness.
     input_chain.push(format!("fps={target_fps}"));
 
-    if let Some(events_file) = events {
+    if ENABLE_CUSTOM_CURSOR_OVERLAY_EXPORT {
+        if let Some(plan) = build_cursor_overlay_plan(
+            project,
+            events,
+            &camera_states,
+            source_duration_ms,
+            project.duration_ms.max(1),
+            source_width.max(1),
+            source_height.max(1),
+            target_width.max(1),
+            target_height.max(1),
+            render_fps,
+        )? {
+            cursor_input_path = Some(plan.cursor_png_path);
+            cursor_overlay_filter = Some(plan.filter_chain);
+        }
+    } else if let Some(events_file) = events {
         if !events_file.events.is_empty() {
-            let ass = build_cursor_ass_file(
+            match build_vector_cursor_ass_file(
                 project,
                 events_file,
+                &camera_states,
                 source_duration_ms,
                 project.duration_ms.max(1),
                 source_width.max(1),
                 source_height.max(1),
+                target_width.max(1),
+                target_height.max(1),
                 render_fps,
-            )?;
-            let escaped = escape_filter_path(&ass);
-            input_chain.push(format!("subtitles=filename='{escaped}'"));
-            cursor_ass_file = Some(ass);
+            ) {
+                Ok(ass) => {
+                    let escaped = escape_filter_path(&ass);
+                    cursor_overlay_filter =
+                        Some(format!("[framed]subtitles=filename='{escaped}'[vout]"));
+                    cursor_temp_file = Some(ass);
+                }
+                Err(err) => {
+                    log::warn!("build_export_filter_graph: vector cursor overlay disabled: {err}");
+                }
+            }
         }
     }
 
     input_chain.push("split=2[base][zoom]".to_string());
 
+    let post_camera_chain = if let Some(cursor_overlay_filter) = cursor_overlay_filter {
+        format!(
+            "[cam]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black[framed];\
+             {cursor_overlay_filter}",
+            w = target_width,
+            h = target_height,
+            cursor_overlay_filter = cursor_overlay_filter
+        )
+    } else {
+        format!(
+            "[cam]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black[vout]",
+            w = target_width,
+            h = target_height
+        )
+    };
+
     let graph = format!(
         "{input};\
          [zoom]scale=w='iw*({zoom})':h='ih*({zoom})':eval=frame[scaled];\
          [base][scaled]overlay=x='-max(0,min({x},overlay_w-main_w))':y='-max(0,min({y},overlay_h-main_h))':eval=frame[cam];\
-         [cam]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
+         {post_camera}",
         input = input_chain.join(","),
         zoom = zoom_expr,
         x = offset_x_expr,
         y = offset_y_expr,
-        w = target_width,
-        h = target_height
+        post_camera = post_camera_chain
     );
 
-    Ok((graph, cursor_ass_file))
+    Ok((graph, cursor_input_path, cursor_temp_file))
 }
 
 fn build_camera_states(
@@ -842,7 +917,7 @@ fn evaluate_spring_axis(
 
 fn build_camera_value_expr(
     states: &[CameraState],
-    axis: impl Fn(&CameraState) -> AxisSpringSegment,
+    axis: impl Fn(&CameraState) -> AxisSpringSegment + Copy,
     default_value: f64,
     source_fps: f64,
 ) -> String {
@@ -853,6 +928,14 @@ fn build_camera_value_expr(
             .then_with(|| left.end_frame.total_cmp(&right.end_frame))
     });
     let safe_fps = source_fps.max(1.0);
+
+    if ordered.len() > MAX_CAMERA_STATES_FOR_ANALYTIC_EXPR {
+        let sampled = sample_camera_value_points(&ordered, axis, default_value, safe_fps);
+        let reduced = decimate_time_value_points(&sampled, MAX_CAMERA_POINTS_FOR_EXPR);
+        let duration_ms = reduced.last().map(|(ts, _)| *ts).unwrap_or(0);
+        return build_piecewise_track_expr(&reduced, duration_ms);
+    }
+
     let default_expr = format_f64(default_value);
     let mut terms = Vec::with_capacity(ordered.len() + 1);
     terms.push(default_expr.clone());
@@ -878,6 +961,49 @@ fn build_camera_value_expr(
     }
 
     terms.join("+")
+}
+
+fn sample_camera_value_points(
+    states: &[CameraState],
+    axis: impl Fn(&CameraState) -> AxisSpringSegment + Copy,
+    default_value: f64,
+    source_fps: f64,
+) -> Vec<(u64, f64)> {
+    if states.is_empty() {
+        return vec![(0, default_value)];
+    }
+
+    let safe_fps = source_fps.max(1.0);
+    let max_frame = states
+        .iter()
+        .map(|state| state.end_frame)
+        .fold(0.0, f64::max)
+        .ceil()
+        .max(1.0);
+    let step_frames = (safe_fps / CAMERA_FALLBACK_SAMPLE_RATE_HZ.max(1.0)).max(1.0);
+
+    let mut points: Vec<(u64, f64)> = Vec::new();
+    let mut frame = 0.0;
+    while frame <= max_frame {
+        let ts_ms = ((frame / safe_fps) * 1000.0).round().max(0.0) as u64;
+        let value = sample_camera_axis_value(states, frame, safe_fps, axis, default_value);
+        points.push((ts_ms, value));
+        frame += step_frames;
+    }
+
+    let last_ts_ms = ((max_frame / safe_fps) * 1000.0).round().max(0.0) as u64;
+    if points
+        .last()
+        .map(|(ts, _)| *ts != last_ts_ms)
+        .unwrap_or(true)
+    {
+        let value = sample_camera_axis_value(states, max_frame, safe_fps, axis, default_value);
+        points.push((last_ts_ms, value));
+    }
+
+    points.sort_by_key(|(ts, _)| *ts);
+    points.dedup_by(|left, right| left.0 == right.0);
+    points
 }
 
 fn spring_value_expr(
@@ -1025,67 +1151,70 @@ fn format_f64(value: f64) -> String {
     format!("{value:.4}")
 }
 
-fn build_cursor_ass_file(
+fn build_cursor_overlay_plan(
     project: &Project,
-    events_file: &EventsFile,
+    events: Option<&EventsFile>,
+    camera_states: &[CameraState],
     source_duration_ms: u64,
     project_duration_ms: u64,
     source_width: u32,
     source_height: u32,
+    target_width: u32,
+    target_height: u32,
     render_fps: f64,
-) -> Result<PathBuf, String> {
+) -> Result<Option<CursorOverlayPlan>, String> {
+    let Some(events_file) = events else {
+        return Ok(None);
+    };
+    if events_file.events.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(cursor_asset) = resolve_cursor_asset_for_render()? else {
+        return Ok(None);
+    };
+
     let mut points = smooth_cursor_path(
         &events_file.events,
         project.settings.cursor.smoothing_factor,
     );
     if points.is_empty() {
-        return Err("No cursor points available for export".to_string());
+        return Ok(None);
     }
 
     points.sort_by_key(|point| point.ts);
-    let frame_step_ms = (1000.0 / render_fps.max(1.0)).clamp(1.0, 100.0);
-    let frame_count = ((source_duration_ms as f64 / frame_step_ms).ceil() as usize).max(2);
-    let cursor_font_size = (project.settings.cursor.size * 36.0)
-        .clamp(8.0, 140.0)
-        .round() as u32;
-    let cursor_outline = (project.settings.cursor.size * 1.8).clamp(1.0, 8.0);
-    let cursor_color = rgb_hex_to_ass_color(&project.settings.cursor.color)
-        .unwrap_or_else(|| "&H00FFFFFF".to_string());
+    let desired_samples = (((source_duration_ms as f64) / 100.0).ceil() as usize)
+        .clamp(24, MAX_CURSOR_SAMPLES_FOR_EXPR)
+        .max(2);
+    let frame_count = desired_samples - 1;
+    let frame_step_ms = (source_duration_ms as f64 / frame_count as f64).max(1.0);
 
-    let ass_path = std::env::temp_dir().join(format!("nsc-cursor-{}-{}.ass", project.id, now_ms()));
-    let mut file = File::create(&ass_path)
-        .map_err(|e| format!("Failed to create temporary cursor subtitle file: {e}"))?;
+    let raw_click_times: Vec<u64> = events_file
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            InputEvent::Click { ts, .. } => {
+                Some(map_time_ms(*ts, project_duration_ms, source_duration_ms))
+            }
+            _ => None,
+        })
+        .collect();
+    let click_times = compact_click_times(
+        &decimate_u64_points(&raw_click_times, MAX_CLICK_EVENTS_FOR_EXPR),
+        MIN_CLICK_PULSE_GAP_MS,
+    );
 
-    writeln!(file, "[Script Info]").map_err(|e| format!("Failed to write ass header: {e}"))?;
-    writeln!(file, "ScriptType: v4.00+").map_err(|e| format!("Failed to write ass header: {e}"))?;
-    writeln!(file, "PlayResX: {source_width}")
-        .map_err(|e| format!("Failed to write ass header: {e}"))?;
-    writeln!(file, "PlayResY: {source_height}")
-        .map_err(|e| format!("Failed to write ass header: {e}"))?;
-    writeln!(file).map_err(|e| format!("Failed to write ass header: {e}"))?;
-    writeln!(file, "[V4+ Styles]").map_err(|e| format!("Failed to write ass style: {e}"))?;
-    writeln!(
-        file,
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
-    )
-    .map_err(|e| format!("Failed to write ass style format: {e}"))?;
-    writeln!(
-        file,
-        "Style: Cursor,Segoe UI,12,{cursor_color},&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,5,0,0,0,1"
-    )
-    .map_err(|e| format!("Failed to write ass style body: {e}"))?;
-    writeln!(file).map_err(|e| format!("Failed to write ass style: {e}"))?;
-    writeln!(file, "[Events]").map_err(|e| format!("Failed to write ass events: {e}"))?;
-    writeln!(
-        file,
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
-    )
-    .map_err(|e| format!("Failed to write ass events format: {e}"))?;
+    let target_min_side = target_width.min(target_height).max(1) as f64;
+    let cursor_height_px =
+        (project.settings.cursor.size * target_min_side * CURSOR_SIZE_TO_FRAME_RATIO)
+            .clamp(8.0, 280.0);
 
     let screen_w = events_file.screen_width.max(1) as f64;
     let screen_h = events_file.screen_height.max(1) as f64;
     let src_w = source_width as f64;
     let src_h = source_height as f64;
+    let dst_w = target_width as f64;
+    let dst_h = target_height as f64;
     let mut mapped_points: Vec<(u64, f64, f64)> = points
         .into_iter()
         .map(|point| {
@@ -1107,40 +1236,531 @@ fn build_cursor_ass_file(
         mapped_points.push((source_duration_ms, only.1, only.2));
     }
 
-    let mut sampled: Vec<(u64, i64, i64)> = Vec::with_capacity(frame_count + 1);
+    let mut sampled: Vec<(u64, f64, f64)> = Vec::with_capacity(frame_count + 1);
     for frame in 0..=frame_count {
         let frame_ms = ((frame as f64) * frame_step_ms)
             .round()
             .clamp(0.0, source_duration_ms as f64) as u64;
-        let (x, y) = interpolate_cursor_position(&mapped_points, frame_ms);
-        sampled.push((frame_ms, x.round() as i64, y.round() as i64));
+        let frame_no = frame as f64;
+        let (src_x, src_y) = interpolate_cursor_position(&mapped_points, frame_ms);
+        let zoom =
+            sample_camera_axis_value(camera_states, frame_no, render_fps, |state| state.zoom, 1.0);
+        let offset_x = sample_camera_axis_value(
+            camera_states,
+            frame_no,
+            render_fps,
+            |state| state.offset_x,
+            0.0,
+        );
+        let offset_y = sample_camera_axis_value(
+            camera_states,
+            frame_no,
+            render_fps,
+            |state| state.offset_y,
+            0.0,
+        );
+
+        let (x, y) = map_cursor_to_output_space(
+            src_x, src_y, zoom, offset_x, offset_y, src_w, src_h, dst_w, dst_h,
+        );
+        sampled.push((frame_ms, x, y));
     }
 
-    sampled.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2);
+    sampled.dedup_by(|left, right| {
+        left.0 == right.0 && (left.1 - right.1).abs() < 0.1 && (left.2 - right.2).abs() < 0.1
+    });
+    let sampled = decimate_cursor_samples(&sampled, MAX_CURSOR_SAMPLES_FOR_EXPR);
+
+    let x_points: Vec<(u64, f64)> = sampled.iter().map(|(ts, x, _)| (*ts, *x)).collect();
+    let y_points: Vec<(u64, f64)> = sampled.iter().map(|(ts, _, y)| (*ts, *y)).collect();
+
+    let x_track_expr = build_piecewise_track_expr(&x_points, source_duration_ms);
+    let y_track_expr = build_piecewise_track_expr(&y_points, source_duration_ms);
+
+    let base_cursor_scale = cursor_height_px / cursor_asset.height.max(1) as f64;
+    let pulse_factor_expr = build_click_pulse_factor_expr(&click_times);
+    let scale_expr = format!(
+        "({base_scale})*({pulse_factor})",
+        base_scale = format_f64(base_cursor_scale),
+        pulse_factor = pulse_factor_expr
+    );
+
+    let cursor_width_expr = format!(
+        "max(2,{asset_w}*({scale}))",
+        asset_w = format_f64(cursor_asset.width as f64),
+        scale = scale_expr
+    );
+    let cursor_height_expr = format!(
+        "max(2,{asset_h}*({scale}))",
+        asset_h = format_f64(cursor_asset.height as f64),
+        scale = scale_expr
+    );
+    let overlay_x_expr = format!(
+        "({x})-({hotspot_x})*({scale})",
+        x = x_track_expr,
+        hotspot_x = format_f64(cursor_asset.hotspot_x),
+        scale = scale_expr
+    );
+    let overlay_y_expr = format!(
+        "({y})-({hotspot_y})*({scale})",
+        y = y_track_expr,
+        hotspot_y = format_f64(cursor_asset.hotspot_y),
+        scale = scale_expr
+    );
+
+    Ok(Some(CursorOverlayPlan {
+        cursor_png_path: cursor_asset.png_path,
+        filter_chain: format!(
+            "[1:v]format=rgba,scale=w='{w}':h='{h}':eval=frame[cursor];\
+             [framed][cursor]overlay=x='{x}':y='{y}':eval=frame:format=auto[vout]",
+            w = cursor_width_expr,
+            h = cursor_height_expr,
+            x = overlay_x_expr,
+            y = overlay_y_expr,
+        ),
+    }))
+}
+
+fn build_vector_cursor_ass_file(
+    project: &Project,
+    events_file: &EventsFile,
+    camera_states: &[CameraState],
+    source_duration_ms: u64,
+    project_duration_ms: u64,
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+    render_fps: f64,
+) -> Result<PathBuf, String> {
+    let mut points = smooth_cursor_path(
+        &events_file.events,
+        project.settings.cursor.smoothing_factor,
+    );
+    if points.is_empty() {
+        return Err("No cursor points available for export".to_string());
+    }
+
+    points.sort_by_key(|point| point.ts);
+
+    let sample_fps = VECTOR_CURSOR_SAMPLE_FPS.clamp(8.0, 30.0);
+    let frame_step_ms = (1000.0 / sample_fps).max(1.0);
+    let frame_count = ((source_duration_ms as f64 / frame_step_ms).ceil() as usize).max(2);
+
+    let screen_w = events_file.screen_width.max(1) as f64;
+    let screen_h = events_file.screen_height.max(1) as f64;
+    let src_w = source_width.max(1) as f64;
+    let src_h = source_height.max(1) as f64;
+    let dst_w = target_width.max(1) as f64;
+    let dst_h = target_height.max(1) as f64;
+
+    let mut mapped_points: Vec<(u64, f64, f64)> = points
+        .into_iter()
+        .map(|point| {
+            (
+                map_time_ms(point.ts, project_duration_ms, source_duration_ms),
+                (point.x / screen_w * src_w).clamp(0.0, src_w),
+                (point.y / screen_h * src_h).clamp(0.0, src_h),
+            )
+        })
+        .collect();
+    mapped_points.sort_by_key(|point| point.0);
+    mapped_points.dedup_by(|left, right| left.0 == right.0);
+    if mapped_points.is_empty() {
+        return Err("No mapped cursor points for export".to_string());
+    }
+    if mapped_points.len() == 1 {
+        let only = mapped_points[0];
+        mapped_points.push((source_duration_ms, only.1, only.2));
+    }
+
+    let raw_click_times: Vec<u64> = events_file
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            InputEvent::Click { ts, .. } => {
+                Some(map_time_ms(*ts, project_duration_ms, source_duration_ms))
+            }
+            _ => None,
+        })
+        .collect();
+    let click_times = compact_click_times(
+        &decimate_u64_points(&raw_click_times, MAX_CLICK_EVENTS_FOR_EXPR),
+        MIN_CLICK_PULSE_GAP_MS,
+    );
+
+    let mut sampled: Vec<(u64, i64, i64, f64)> = Vec::with_capacity(frame_count + 1);
+    for frame in 0..=frame_count {
+        let frame_ms = ((frame as f64) * frame_step_ms)
+            .round()
+            .clamp(0.0, source_duration_ms as f64) as u64;
+        let frame_no = (frame_ms as f64 / 1000.0) * render_fps.max(1.0);
+        let (src_x, src_y) = interpolate_cursor_position(&mapped_points, frame_ms);
+        let zoom = sample_camera_axis_value(
+            camera_states,
+            frame_no,
+            render_fps.max(1.0),
+            |state| state.zoom,
+            1.0,
+        );
+        let offset_x = sample_camera_axis_value(
+            camera_states,
+            frame_no,
+            render_fps.max(1.0),
+            |state| state.offset_x,
+            0.0,
+        );
+        let offset_y = sample_camera_axis_value(
+            camera_states,
+            frame_no,
+            render_fps.max(1.0),
+            |state| state.offset_y,
+            0.0,
+        );
+        let (x, y) = map_cursor_to_output_space(
+            src_x, src_y, zoom, offset_x, offset_y, src_w, src_h, dst_w, dst_h,
+        );
+        let pulse_scale = sample_click_pulse_scale_scalar(&click_times, frame_ms);
+        let combined_scale = (zoom.max(1.0) * pulse_scale).clamp(0.5, 4.0);
+        sampled.push((frame_ms, x.round() as i64, y.round() as i64, combined_scale));
+    }
+
+    sampled.dedup_by(|left, right| {
+        left.0 == right.0
+            && left.1 == right.1
+            && left.2 == right.2
+            && (left.3 - right.3).abs() < 0.01
+    });
+    let sampled = decimate_cursor_samples_scaled(&sampled, 480);
+
+    let target_min_side = target_width.min(target_height).max(1) as f64;
+    let cursor_height_px =
+        (project.settings.cursor.size * target_min_side * CURSOR_SIZE_TO_FRAME_RATIO)
+            .clamp(8.0, 220.0);
+    let cursor_scale_percent = (cursor_height_px / VECTOR_CURSOR_ASS_BASE_HEIGHT) * 100.0;
+    let cursor_outline_px = (cursor_height_px * 0.08).clamp(1.0, 5.0);
+
+    let ass_path =
+        std::env::temp_dir().join(format!("nsc-vcursor-{}-{}.ass", project.id, now_ms()));
+    let mut file = File::create(&ass_path)
+        .map_err(|e| format!("Failed to create vector cursor ass file: {e}"))?;
+
+    writeln!(file, "[Script Info]").map_err(|e| format!("Failed to write ass header: {e}"))?;
+    writeln!(file, "ScriptType: v4.00+").map_err(|e| format!("Failed to write ass header: {e}"))?;
+    writeln!(file, "PlayResX: {target_width}")
+        .map_err(|e| format!("Failed to write ass header: {e}"))?;
+    writeln!(file, "PlayResY: {target_height}")
+        .map_err(|e| format!("Failed to write ass header: {e}"))?;
+    writeln!(file).map_err(|e| format!("Failed to write ass header: {e}"))?;
+    writeln!(file, "[V4+ Styles]").map_err(|e| format!("Failed to write ass styles: {e}"))?;
+    writeln!(
+        file,
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
+    )
+    .map_err(|e| format!("Failed to write ass styles: {e}"))?;
+    writeln!(
+        file,
+        "Style: Cursor,Arial,12,&H00000000,&H00000000,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,2,0,7,0,0,0,1"
+    )
+    .map_err(|e| format!("Failed to write ass styles: {e}"))?;
+    writeln!(file).map_err(|e| format!("Failed to write ass styles: {e}"))?;
+    writeln!(file, "[Events]").map_err(|e| format!("Failed to write ass events: {e}"))?;
+    writeln!(
+        file,
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+    )
+    .map_err(|e| format!("Failed to write ass events: {e}"))?;
 
     for pair in sampled.windows(2) {
-        let (start_ms, x1, y1) = pair[0];
-        let (end_ms, x2, y2) = pair[1];
+        let (start_ms, x1, y1, start_scale) = pair[0];
+        let (end_ms, x2, y2, _) = pair[1];
         if end_ms <= start_ms {
             continue;
         }
+        let scale_percent = cursor_scale_percent * start_scale;
+        let outline_px = cursor_outline_px * start_scale.clamp(0.75, 2.5);
 
         writeln!(
             file,
-            "Dialogue: 0,{},{},Cursor,,0,0,0,,{{\\an5\\fs{}\\bord{:.2}\\shad0\\move({},{},{},{})}}o",
+            "Dialogue: 0,{},{},Cursor,,0,0,0,,{{\\an7\\p1\\fscx{:.2}\\fscy{:.2}\\bord{:.2}\\shad0\\move({},{},{},{})}}{}",
             format_ass_time(start_ms),
             format_ass_time(end_ms),
-            cursor_font_size,
-            cursor_outline,
+            scale_percent,
+            scale_percent,
+            outline_px,
             x1,
             y1,
             x2,
-            y2
+            y2,
+            VECTOR_CURSOR_ASS_PATH
         )
         .map_err(|e| format!("Failed to write ass cursor event: {e}"))?;
     }
 
     Ok(ass_path)
+}
+
+fn decimate_cursor_samples(points: &[(u64, f64, f64)], max_points: usize) -> Vec<(u64, f64, f64)> {
+    if points.len() <= max_points || max_points < 2 {
+        return points.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(max_points);
+    let last_index = points.len() - 1;
+    let max_index = max_points - 1;
+    let mut prev_idx = usize::MAX;
+
+    for index in 0..max_points {
+        let sample_idx = index * last_index / max_index;
+        if sample_idx == prev_idx {
+            continue;
+        }
+        result.push(points[sample_idx]);
+        prev_idx = sample_idx;
+    }
+
+    if result.last().map(|point| point.0) != points.last().map(|point| point.0) {
+        result.push(points[last_index]);
+    }
+
+    result
+}
+
+fn decimate_cursor_samples_scaled(
+    points: &[(u64, i64, i64, f64)],
+    max_points: usize,
+) -> Vec<(u64, i64, i64, f64)> {
+    if points.len() <= max_points || max_points < 2 {
+        return points.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(max_points);
+    let last_index = points.len() - 1;
+    let max_index = max_points - 1;
+    let mut prev_idx = usize::MAX;
+
+    for index in 0..max_points {
+        let sample_idx = index * last_index / max_index;
+        if sample_idx == prev_idx {
+            continue;
+        }
+        result.push(points[sample_idx]);
+        prev_idx = sample_idx;
+    }
+
+    if result.last().map(|point| point.0) != points.last().map(|point| point.0) {
+        result.push(points[last_index]);
+    }
+
+    result
+}
+
+fn decimate_time_value_points(points: &[(u64, f64)], max_points: usize) -> Vec<(u64, f64)> {
+    if points.len() <= max_points || max_points < 2 {
+        return points.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(max_points);
+    let last_index = points.len() - 1;
+    let max_index = max_points - 1;
+    let mut prev_idx = usize::MAX;
+
+    for index in 0..max_points {
+        let sample_idx = index * last_index / max_index;
+        if sample_idx == prev_idx {
+            continue;
+        }
+        result.push(points[sample_idx]);
+        prev_idx = sample_idx;
+    }
+
+    if result.last().map(|point| point.0) != points.last().map(|point| point.0) {
+        result.push(points[last_index]);
+    }
+
+    result
+}
+
+fn decimate_u64_points(points: &[u64], max_points: usize) -> Vec<u64> {
+    if points.len() <= max_points || max_points < 2 {
+        return points.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(max_points);
+    let last_index = points.len() - 1;
+    let max_index = max_points - 1;
+    let mut prev_idx = usize::MAX;
+
+    for index in 0..max_points {
+        let sample_idx = index * last_index / max_index;
+        if sample_idx == prev_idx {
+            continue;
+        }
+        result.push(points[sample_idx]);
+        prev_idx = sample_idx;
+    }
+
+    if result.last().copied() != points.last().copied() {
+        result.push(points[last_index]);
+    }
+
+    result
+}
+
+fn compact_click_times(points: &[u64], min_gap_ms: u64) -> Vec<u64> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted = points.to_vec();
+    sorted.sort_unstable();
+
+    let mut result = Vec::with_capacity(sorted.len());
+    let mut last_kept: Option<u64> = None;
+    for ts in sorted {
+        if let Some(last) = last_kept {
+            if ts.saturating_sub(last) < min_gap_ms {
+                continue;
+            }
+        }
+        result.push(ts);
+        last_kept = Some(ts);
+    }
+    result
+}
+
+fn build_piecewise_track_expr(points: &[(u64, f64)], duration_ms: u64) -> String {
+    if points.is_empty() {
+        return "0".to_string();
+    }
+
+    let mut normalized = points.to_vec();
+    normalized.sort_by_key(|(ts, _)| *ts);
+    normalized.dedup_by(|left, right| left.0 == right.0);
+
+    if normalized[0].0 > 0 {
+        normalized.insert(0, (0, normalized[0].1));
+    }
+    if normalized
+        .last()
+        .is_some_and(|(last_ts, _)| *last_ts < duration_ms)
+    {
+        let last = *normalized.last().expect("normalized has last");
+        normalized.push((duration_ms, last.1));
+    }
+
+    let base = normalized[0].1;
+    let mut terms = vec![format_f64(base)];
+
+    for pair in normalized.windows(2) {
+        let (start_ms, start_value) = pair[0];
+        let (end_ms, end_value) = pair[1];
+        if end_ms <= start_ms {
+            continue;
+        }
+
+        let start_s = start_ms as f64 / 1000.0;
+        let end_s = end_ms as f64 / 1000.0;
+        let span_s = ((end_ms - start_ms) as f64 / 1000.0).max(0.0001);
+        let delta = end_value - start_value;
+        let interp_expr = format!(
+            "({start}+((t-{start_t})/{span})*({delta}))",
+            start = format_f64(start_value),
+            start_t = format_f64(start_s),
+            span = format_f64(span_s),
+            delta = format_f64(delta)
+        );
+        terms.push(format!(
+            "if(gte(t,{start})*lt(t,{end}),({interp})-({base}),0)",
+            start = format_f64(start_s),
+            end = format_f64(end_s),
+            interp = interp_expr,
+            base = format_f64(base)
+        ));
+    }
+
+    if let Some((last_ts, last_value)) = normalized.last() {
+        terms.push(format!(
+            "if(gte(t,{start}),({last})-({base}),0)",
+            start = format_f64(*last_ts as f64 / 1000.0),
+            last = format_f64(*last_value),
+            base = format_f64(base)
+        ));
+    }
+
+    terms.join("+")
+}
+
+fn build_click_pulse_factor_expr(click_times_ms: &[u64]) -> String {
+    if click_times_ms.is_empty() {
+        return "1".to_string();
+    }
+
+    let mut terms = vec!["1".to_string()];
+    let amp = 1.0 - CLICK_PULSE_MIN_SCALE;
+    let down_s = CLICK_PULSE_DOWN_MS / 1000.0;
+    let up_s = (CLICK_PULSE_TOTAL_MS - CLICK_PULSE_DOWN_MS).max(1.0) / 1000.0;
+
+    for click_ms in click_times_ms {
+        let click_s = *click_ms as f64 / 1000.0;
+        let down_end_s = click_s + down_s;
+        let up_end_s = click_s + (CLICK_PULSE_TOTAL_MS / 1000.0);
+
+        let down_expr = format!(
+            "1-({amp})*((t-{start})/{down})",
+            amp = format_f64(amp),
+            start = format_f64(click_s),
+            down = format_f64(down_s)
+        );
+        let up_expr = format!(
+            "{min}+({amp})*((t-{start})/{up})",
+            min = format_f64(CLICK_PULSE_MIN_SCALE),
+            amp = format_f64(amp),
+            start = format_f64(down_end_s),
+            up = format_f64(up_s)
+        );
+
+        terms.push(format!(
+            "if(gte(t,{start})*lt(t,{end}),({value})-1,0)",
+            start = format_f64(click_s),
+            end = format_f64(down_end_s),
+            value = down_expr
+        ));
+        terms.push(format!(
+            "if(gte(t,{start})*lt(t,{end}),({value})-1,0)",
+            start = format_f64(down_end_s),
+            end = format_f64(up_end_s),
+            value = up_expr
+        ));
+    }
+
+    terms.join("+")
+}
+
+fn sample_click_pulse_scale_scalar(click_times_ms: &[u64], ts_ms: u64) -> f64 {
+    if click_times_ms.is_empty() {
+        return 1.0;
+    }
+
+    let idx = click_times_ms.partition_point(|&click_ts| click_ts <= ts_ms);
+    if idx == 0 {
+        return 1.0;
+    }
+
+    let click_ts = click_times_ms[idx - 1];
+    let dt_ms = ts_ms.saturating_sub(click_ts) as f64;
+    if dt_ms < 0.0 || dt_ms > CLICK_PULSE_TOTAL_MS {
+        return 1.0;
+    }
+
+    if dt_ms <= CLICK_PULSE_DOWN_MS {
+        let t = dt_ms / CLICK_PULSE_DOWN_MS.max(1.0);
+        return 1.0 - (1.0 - CLICK_PULSE_MIN_SCALE) * t;
+    }
+
+    let up_duration = (CLICK_PULSE_TOTAL_MS - CLICK_PULSE_DOWN_MS).max(1.0);
+    let t = (dt_ms - CLICK_PULSE_DOWN_MS) / up_duration;
+    CLICK_PULSE_MIN_SCALE + (1.0 - CLICK_PULSE_MIN_SCALE) * t
 }
 
 fn update_status(state: &Arc<Mutex<ExportStatus>>, updater: impl FnOnce(&mut ExportStatus)) {
@@ -1238,6 +1858,24 @@ fn map_time_ms(ts: u64, from_duration_ms: u64, to_duration_ms: u64) -> u64 {
     mapped.round().clamp(0.0, to_duration_ms as f64) as u64
 }
 
+fn format_ass_time(ms: u64) -> String {
+    let total_centis = ms / 10;
+    let centis = total_centis % 100;
+    let total_seconds = total_centis / 100;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+    format!("{hours}:{minutes:02}:{seconds:02}.{centis:02}")
+}
+
+fn escape_filter_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .replace(':', "\\:")
+        .replace('\'', "\\'")
+}
+
 fn interpolate_cursor_position(points: &[(u64, f64, f64)], ts: u64) -> (f64, f64) {
     if points.is_empty() {
         return (0.0, 0.0);
@@ -1279,33 +1917,68 @@ fn interpolate_cursor_position(points: &[(u64, f64, f64)], ts: u64) -> (f64, f64
     )
 }
 
-fn format_ass_time(ms: u64) -> String {
-    let total_cs = ms / 10;
-    let cs = total_cs % 100;
-    let total_seconds = total_cs / 100;
-    let seconds = total_seconds % 60;
-    let total_minutes = total_seconds / 60;
-    let minutes = total_minutes % 60;
-    let hours = total_minutes / 60;
-    format!("{hours}:{minutes:02}:{seconds:02}.{cs:02}")
-}
-
-fn rgb_hex_to_ass_color(hex: &str) -> Option<String> {
-    let value = hex.trim().trim_start_matches('#');
-    if value.len() != 6 {
-        return None;
+fn sample_camera_axis_value(
+    states: &[CameraState],
+    frame: f64,
+    source_fps: f64,
+    axis: impl Fn(&CameraState) -> AxisSpringSegment,
+    default_value: f64,
+) -> f64 {
+    let safe_fps = source_fps.max(1.0);
+    for state in states {
+        if frame < state.start_frame || frame >= state.end_frame {
+            continue;
+        }
+        let elapsed_seconds = ((frame - state.start_frame) / safe_fps).max(0.0);
+        let axis_state = axis(state);
+        let evaluated = evaluate_spring_axis(
+            AxisSpringState {
+                value: axis_state.start,
+                velocity: axis_state.velocity,
+            },
+            axis_state.target,
+            state.spring,
+            elapsed_seconds,
+        );
+        return evaluated.value;
     }
-    let rr = u8::from_str_radix(&value[0..2], 16).ok()?;
-    let gg = u8::from_str_radix(&value[2..4], 16).ok()?;
-    let bb = u8::from_str_radix(&value[4..6], 16).ok()?;
-    Some(format!("&H00{bb:02X}{gg:02X}{rr:02X}"))
+    default_value
 }
 
-fn escape_filter_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "/")
-        .replace(':', "\\:")
-        .replace('\'', "\\'")
+fn map_cursor_to_output_space(
+    source_x: f64,
+    source_y: f64,
+    zoom: f64,
+    offset_x: f64,
+    offset_y: f64,
+    source_width: f64,
+    source_height: f64,
+    target_width: f64,
+    target_height: f64,
+) -> (f64, f64) {
+    let safe_zoom = zoom.max(1.0);
+    let scaled_width = source_width * safe_zoom;
+    let scaled_height = source_height * safe_zoom;
+    let max_offset_x = (scaled_width - source_width).max(0.0);
+    let max_offset_y = (scaled_height - source_height).max(0.0);
+    let clamped_offset_x = offset_x.clamp(0.0, max_offset_x);
+    let clamped_offset_y = offset_y.clamp(0.0, max_offset_y);
+
+    let camera_x = (source_x * safe_zoom - clamped_offset_x).clamp(0.0, source_width);
+    let camera_y = (source_y * safe_zoom - clamped_offset_y).clamp(0.0, source_height);
+
+    let fit_scale = (target_width / source_width)
+        .min(target_height / source_height)
+        .max(0.0001);
+    let fitted_width = source_width * fit_scale;
+    let fitted_height = source_height * fit_scale;
+    let pad_x = (target_width - fitted_width) * 0.5;
+    let pad_y = (target_height - fitted_height) * 0.5;
+
+    (
+        (camera_x * fit_scale + pad_x).clamp(0.0, target_width),
+        (camera_y * fit_scale + pad_y).clamp(0.0, target_height),
+    )
 }
 
 fn probe_media_info(source_video: &Path) -> MediaProbe {
@@ -1511,11 +2184,12 @@ mod tests {
     #[test]
     fn filter_graph_uses_dynamic_zoom_pipeline() {
         let project = sample_project();
-        let (graph, cursor_file) =
+        let (graph, cursor_file, temp_file) =
             build_export_filter_graph(&project, None, 1920, 1080, 30, 10_000, 1920, 1080)
                 .expect("filter graph");
 
         assert!(cursor_file.is_none());
+        assert!(temp_file.is_none());
         assert!(graph.contains("split=2[base][zoom]"));
         assert!(graph.contains("scale=w='iw*("));
         assert!(graph.contains("exp("));

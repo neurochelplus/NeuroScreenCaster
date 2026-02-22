@@ -1,39 +1,108 @@
 .record-screen {
-  max-width: 640px;
-  margin: 0 auto;
+  height: 100%;
   display: flex;
   flex-direction: column;
-  gap: 24px;
 }
 
-.record-header h1 {
-  font-size: 22px;
-  font-weight: 600;
-  margin-bottom: 4px;
+.record-workspace {
+  min-height: 0;
+  flex: 1;
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 18px;
 }
 
-.record-subtitle {
-  color: var(--text-secondary);
-  font-size: 13px;
-}
-
-.record-card {
+.record-settings {
   background: var(--bg-secondary);
   border: 1px solid var(--border);
   border-radius: 12px;
-  padding: 28px;
+  padding: 16px;
   display: flex;
   flex-direction: column;
+  gap: 14px;
+}
+
+.record-settings h2 {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.record-settings label,
+.record-fps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.record-settings label span,
+.record-fps span {
+  font-size: 12px;
+  color: var(--text-secondary);
+  letter-spacing: 0.2px;
+}
+
+.record-settings select {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-radius: 8px;
+  padding: 9px 10px;
+  font-size: 13px;
+}
+
+.record-fps-options {
+  display: flex;
+  gap: 8px;
+}
+
+.record-fps-options button {
+  flex: 1;
+}
+
+.record-fps-options .record-fps-btn[data-active="true"] {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+  opacity: 1;
+}
+
+.record-fps-options .record-fps-btn[data-active="true"]:disabled {
+  opacity: 1;
+}
+
+.record-fps-current {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.record-stage {
+  min-height: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.record-stage-header {
+  display: flex;
   align-items: center;
-  gap: 20px;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.record-stage-header h1 {
+  font-size: 20px;
+  font-weight: 600;
 }
 
 .record-status {
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-size: 15px;
-  font-weight: 500;
+  gap: 8px;
+  font-size: 13px;
   color: var(--text-secondary);
 }
 
@@ -50,83 +119,82 @@
 
 .record-status--active .record-indicator {
   background: var(--danger);
-  box-shadow: 0 0 0 0 rgba(232, 64, 64, 0.4);
-  animation: pulse 1.5s ease-in-out infinite;
+  box-shadow: 0 0 0 0 rgba(232, 64, 64, 0.45);
+  animation: record-pulse 1.5s ease-in-out infinite;
 }
 
-@keyframes pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(232, 64, 64, 0.4); }
-  50% { box-shadow: 0 0 0 6px rgba(232, 64, 64, 0); }
+.record-stage-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .record-btn {
-  font-size: 15px;
-  padding: 12px 36px;
+  font-size: 14px;
   font-weight: 600;
+  padding: 9px 18px;
 }
 
-.record-meta {
+.record-preview-shell {
+  flex: 1;
+  min-height: 300px;
+  background: #090b12;
+  border: 1px solid #232734;
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+}
+
+.record-preview-video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #08090d;
+}
+
+.record-preview-placeholder {
+  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
+  justify-content: center;
+  gap: 10px;
+  text-align: center;
+  color: var(--text-secondary);
+  padding: 20px;
 }
 
-.record-meta-label {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
-  color: var(--text-secondary);
-}
-
-.record-meta-value {
-  font-family: "Consolas", monospace;
-  font-size: 12px;
-  color: var(--text-secondary);
-  background: var(--bg-tertiary);
-  padding: 4px 10px;
-  border-radius: 4px;
+.record-preview-placeholder strong {
+  color: var(--text-primary);
+  font-size: 14px;
 }
 
 .record-error {
   color: var(--danger);
   font-size: 13px;
   background: rgba(232, 64, 64, 0.1);
-  border: 1px solid rgba(232, 64, 64, 0.3);
-  border-radius: var(--radius);
-  padding: 10px 14px;
-  width: 100%;
+  border: 1px solid rgba(232, 64, 64, 0.35);
+  border-radius: 8px;
+  padding: 10px 12px;
 }
 
-.record-info {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+@keyframes record-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(232, 64, 64, 0.45);
+  }
+  50% {
+    box-shadow: 0 0 0 7px rgba(232, 64, 64, 0);
+  }
 }
 
-.record-info-item {
-  display: flex;
-  gap: 14px;
-  align-items: flex-start;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 14px 16px;
-}
+@media (max-width: 1000px) {
+  .record-workspace {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
 
-.info-icon {
-  font-size: 20px;
-  flex-shrink: 0;
-  margin-top: 2px;
-}
-
-.record-info-item strong {
-  display: block;
-  font-weight: 600;
-  margin-bottom: 2px;
-}
-
-.record-info-item p {
-  font-size: 12px;
-  color: var(--text-secondary);
+  .record-preview-shell {
+    min-height: 240px;
+  }
 }

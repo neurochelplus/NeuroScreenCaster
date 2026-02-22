@@ -8,6 +8,7 @@
 //!   3. `stop_session` отправляет `RawInput::Stop` в процессор и сбрасывает канал.
 //!      Вызывающий ждёт JoinHandle процессора и получает итоговый `Vec<InputEvent>`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -63,6 +64,10 @@ pub struct TelemetryGlobal {
     /// Последняя известная позиция мыши.
     /// rdev не передаёт координаты в Button/Wheel-событиях — храним отдельно.
     pub last_pos: Mutex<(f64, f64)>,
+    /// True when recording is paused and incoming events must be ignored.
+    pub is_paused: AtomicBool,
+    /// Last observed state of Ctrl modifier from global keyboard hook.
+    pub is_ctrl_pressed: AtomicBool,
 }
 
 impl TelemetryGlobal {
@@ -70,6 +75,8 @@ impl TelemetryGlobal {
         Arc::new(Self {
             current_tx: Mutex::new(None),
             last_pos: Mutex::new((0.0, 0.0)),
+            is_paused: AtomicBool::new(false),
+            is_ctrl_pressed: AtomicBool::new(false),
         })
     }
 }
@@ -96,6 +103,20 @@ pub fn spawn_rdev_thread(global: Arc<TelemetryGlobal>) {
 
 /// Обрабатывает одно событие из rdev: при активной сессии отправляет его в процессор.
 fn handle_rdev_event(global: &Arc<TelemetryGlobal>, event: rdev::Event) {
+    match &event.event_type {
+        rdev::EventType::KeyPress(key) if is_ctrl_key(*key) => {
+            global.is_ctrl_pressed.store(true, Ordering::Relaxed);
+        }
+        rdev::EventType::KeyRelease(key) if is_ctrl_key(*key) => {
+            global.is_ctrl_pressed.store(false, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+
+    if global.is_paused.load(Ordering::Relaxed) {
+        return;
+    }
+
     let ts_abs = event
         .time
         .duration_since(UNIX_EPOCH)
@@ -166,6 +187,7 @@ pub fn start_session(
     global: &Arc<TelemetryGlobal>,
     start_ms: u64,
 ) -> std::thread::JoinHandle<Vec<InputEvent>> {
+    global.is_paused.store(false, Ordering::Relaxed);
     let (tx, rx) = sync_channel::<RawInput>(8192);
     *global.current_tx.lock().unwrap() = Some(tx);
 
@@ -258,10 +280,15 @@ pub fn start_session(
 /// Сигнализирует текущей сессии завершиться: отправляет `Stop` и сбрасывает канал.
 /// После этого вызывающий должен дождаться `JoinHandle` процессора.
 pub fn stop_session(global: &Arc<TelemetryGlobal>) {
+    global.is_paused.store(false, Ordering::Relaxed);
     let tx = global.current_tx.lock().unwrap().take();
     if let Some(tx) = tx {
         tx.send(RawInput::Stop).ok();
     }
+}
+
+pub fn set_paused(global: &Arc<TelemetryGlobal>, paused: bool) {
+    global.is_paused.store(paused, Ordering::Relaxed);
 }
 
 // ─── Вспомогательные функции ──────────────────────────────────────────────────
@@ -273,4 +300,8 @@ fn rdev_button(button: rdev::Button) -> MouseButton {
         rdev::Button::Middle => MouseButton::Middle,
         _ => MouseButton::Left,
     }
+}
+
+fn is_ctrl_key(key: rdev::Key) -> bool {
+    matches!(key, rdev::Key::ControlLeft | rdev::Key::ControlRight)
 }

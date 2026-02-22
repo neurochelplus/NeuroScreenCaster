@@ -1,0 +1,35 @@
+.recording-overlay-root {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  padding: 0;
+}
+
+.recording-overlay-panel {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 0;
+  background: rgba(12, 13, 18, 0.5);
+  backdrop-filter: blur(6px);
+  box-shadow: none;
+}
+
+.recording-overlay-panel button {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+.recording-overlay-time {
+  min-width: 62px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+}

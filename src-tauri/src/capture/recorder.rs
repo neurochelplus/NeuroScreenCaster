@@ -29,7 +29,7 @@ use windows_capture::{
 };
 
 /// Target FPS for capture/output.
-pub const TARGET_FPS: u32 = 30;
+pub const DEFAULT_TARGET_FPS: u32 = 60;
 const HNS_PER_SECOND: i64 = 10_000_000;
 
 #[derive(Clone, Debug)]
@@ -38,11 +38,30 @@ pub struct CaptureEncoderSettings {
     pub width: u32,
     pub height: u32,
     pub target_fps: u32,
+    pub quality: RecordingQuality,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordingQuality {
+    Low,
+    Balanced,
+    High,
+}
+
+impl RecordingQuality {
+    fn bitrate_scale(self) -> f64 {
+        match self {
+            RecordingQuality::Low => 0.75,
+            RecordingQuality::Balanced => 1.0,
+            RecordingQuality::High => 1.35,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct CaptureFlags {
     pub stop_flag: Arc<AtomicBool>,
+    pub pause_flag: Arc<AtomicBool>,
     pub encoder: CaptureEncoderSettings,
 }
 
@@ -91,6 +110,7 @@ impl ScreenRecorder {
 fn run_cfr_muxer(
     mut encoder: VideoEncoder,
     stop_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
     frame_slot: Arc<(Mutex<FrameSlot>, Condvar)>,
     target_fps: u32,
 ) -> Result<MuxerStats, Box<dyn std::error::Error + Send + Sync>> {
@@ -104,10 +124,22 @@ fn run_cfr_muxer(
     let mut last_sequence = 0u64;
     let mut frame_index = 0i64;
     let mut next_tick: Option<Instant> = None;
+    let mut was_paused = false;
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
+        }
+
+        if pause_flag.load(Ordering::Relaxed) {
+            was_paused = true;
+            thread::sleep(Duration::from_millis(12));
+            continue;
+        }
+
+        if was_paused {
+            next_tick = Some(Instant::now());
+            was_paused = false;
         }
 
         if active_frame.is_none() {
@@ -202,7 +234,12 @@ impl GraphicsCaptureApiHandler for ScreenRecorder {
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         let flags = ctx.flags;
         let target_fps = flags.encoder.target_fps.max(1);
-        let bitrate = estimate_h264_bitrate(flags.encoder.width, flags.encoder.height, target_fps);
+        let bitrate = estimate_h264_bitrate(
+            flags.encoder.width,
+            flags.encoder.height,
+            target_fps,
+            flags.encoder.quality,
+        );
 
         let video_settings = VideoSettingsBuilder::new(flags.encoder.width, flags.encoder.height)
             .sub_type(VideoSettingsSubType::H264)
@@ -224,10 +261,19 @@ impl GraphicsCaptureApiHandler for ScreenRecorder {
 
         let frame_slot = Arc::new((Mutex::new(FrameSlot::default()), Condvar::new()));
         let muxer_stop_flag = flags.stop_flag.clone();
+        let muxer_pause_flag = flags.pause_flag.clone();
         let muxer_slot = frame_slot.clone();
         let muxer_thread = thread::Builder::new()
             .name("nsc-cfr-muxer".to_string())
-            .spawn(move || run_cfr_muxer(encoder, muxer_stop_flag, muxer_slot, target_fps))
+            .spawn(move || {
+                run_cfr_muxer(
+                    encoder,
+                    muxer_stop_flag,
+                    muxer_pause_flag,
+                    muxer_slot,
+                    target_fps,
+                )
+            })
             .map_err(|err| format!("Failed to spawn CFR muxer thread: {err}"))?;
 
         Ok(Self {
@@ -288,12 +334,12 @@ impl GraphicsCaptureApiHandler for ScreenRecorder {
     }
 }
 
-fn estimate_h264_bitrate(width: u32, height: u32, fps: u32) -> u32 {
+fn estimate_h264_bitrate(width: u32, height: u32, fps: u32, quality: RecordingQuality) -> u32 {
     // Bitrate heuristic tuned for screen content:
     // 1080p30 ~= 7 Mbps, 1440p60 ~= 20 Mbps, 2160p60 ~= 45 Mbps (clamped).
     let pixels_per_second = width as f64 * height as f64 * fps.max(1) as f64;
-    let raw = (pixels_per_second * 0.11).round() as u64;
-    raw.clamp(4_000_000, 45_000_000) as u32
+    let raw = (pixels_per_second * 0.11 * quality.bitrate_scale()).round() as u64;
+    raw.clamp(3_000_000, 60_000_000) as u32
 }
 
 /// Returns monitor physical size by monitor index (0 = primary).
@@ -392,9 +438,12 @@ pub fn find_ffmpeg_exe() -> std::path::PathBuf {
 pub fn start_capture(
     monitor_index: u32,
     stop_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
     output_path: PathBuf,
     width: u32,
     height: u32,
+    target_fps: u32,
+    quality: RecordingQuality,
 ) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
     let monitors =
         Monitor::enumerate().map_err(|e| format!("Failed to enumerate monitors: {e}"))?;
@@ -406,20 +455,24 @@ pub fn start_capture(
 
     let flags = CaptureFlags {
         stop_flag,
+        pause_flag,
         encoder: CaptureEncoderSettings {
             output_path,
             width,
             height,
-            target_fps: TARGET_FPS,
+            target_fps: target_fps.max(1),
+            quality,
         },
     };
+
+    let safe_fps = target_fps.max(1);
 
     let settings = Settings::new(
         monitor,
         CursorCaptureSettings::WithoutCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Custom(Duration::from_secs_f64(1.0 / TARGET_FPS as f64)),
+        MinimumUpdateIntervalSettings::Custom(Duration::from_secs_f64(1.0 / safe_fps as f64)),
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
         flags,
