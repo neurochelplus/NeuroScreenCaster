@@ -10,7 +10,7 @@ use rfd::FileDialog;
 use serde::Serialize;
 
 use crate::algorithm::cursor_smoothing::smooth_cursor_path;
-use crate::capture::recorder::find_ffmpeg_exe;
+use crate::capture::recorder::{apply_no_window_flags, find_ffmpeg_exe};
 use crate::commands::cursor::resolve_cursor_asset_for_render;
 use crate::models::events::{EventsFile, InputEvent, SCHEMA_VERSION as EVENTS_SCHEMA_VERSION};
 use crate::models::project::{
@@ -367,6 +367,7 @@ fn execute_ffmpeg_export(
     let ffmpeg = find_ffmpeg_exe();
 
     let mut command = Command::new(&ffmpeg);
+    apply_no_window_flags(&mut command);
     command.arg("-y").arg("-i").arg(source_video);
 
     if let Some(cursor_image_path) = cursor_image {
@@ -2008,7 +2009,10 @@ fn map_cursor_to_output_space(
 
 fn probe_media_info(source_video: &Path) -> MediaProbe {
     let ffmpeg = find_ffmpeg_exe();
-    let output = Command::new(ffmpeg)
+    let mut command = Command::new(ffmpeg);
+    apply_no_window_flags(&mut command);
+
+    let output = command
         .arg("-i")
         .arg(source_video)
         .stdin(Stdio::null())

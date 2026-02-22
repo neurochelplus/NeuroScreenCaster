@@ -4,7 +4,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use crate::capture::recorder::find_ffmpeg_exe;
+use crate::capture::recorder::{apply_no_window_flags, find_ffmpeg_exe};
 
 const CURSOR_RESOLVED_PNG_NAME: &str = "cursor-resolved.png";
 
@@ -223,7 +223,10 @@ fn should_rebuild_target(source: &Path, target: &Path) -> bool {
 
 fn convert_cursor_with_ffmpeg(source: &Path, target: &Path) -> Result<(), String> {
     let ffmpeg = find_ffmpeg_exe();
-    let output = Command::new(&ffmpeg)
+    let mut command = Command::new(&ffmpeg);
+    apply_no_window_flags(&mut command);
+
+    let output = command
         .arg("-y")
         .arg("-i")
         .arg(source)
@@ -270,7 +273,10 @@ fn convert_cur_with_powershell(source: &Path, target: &Path) -> Result<(), Strin
         dst = target_escaped
     );
 
-    let output = Command::new("powershell")
+    let mut command = Command::new("powershell");
+    apply_no_window_flags(&mut command);
+
+    let output = command
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-ExecutionPolicy")

@@ -13,7 +13,8 @@ use crate::capture::audio_loopback::start_system_loopback_capture;
 use crate::capture::preview::{NativePreviewFrame, NativePreviewState};
 use crate::capture::recorder::RecordingQuality;
 use crate::capture::recorder::{
-    find_ffmpeg_exe, get_monitor_scale_factor, get_monitor_size, start_capture, DEFAULT_TARGET_FPS,
+    apply_no_window_flags, find_ffmpeg_exe, get_monitor_scale_factor, get_monitor_size,
+    start_capture, DEFAULT_TARGET_FPS,
 };
 use crate::capture::state::{
     ActiveRecording, AudioCaptureBackend, AudioCaptureProcess, AudioCaptureSession,
@@ -515,7 +516,10 @@ fn set_event_ts(event: &mut InputEvent, ts: u64) {
 
 fn list_dshow_audio_devices() -> Result<Vec<String>, String> {
     let ffmpeg = find_ffmpeg_exe();
-    let output = Command::new(&ffmpeg)
+    let mut command = Command::new(&ffmpeg);
+    apply_no_window_flags(&mut command);
+
+    let output = command
         .arg("-hide_banner")
         .arg("-list_devices")
         .arg("true")
@@ -652,7 +656,10 @@ fn spawn_audio_capture_process(
     output_path: &Path,
 ) -> Result<AudioCaptureProcess, String> {
     let ffmpeg = find_ffmpeg_exe();
-    let mut child = Command::new(&ffmpeg)
+    let mut command = Command::new(&ffmpeg);
+    apply_no_window_flags(&mut command);
+
+    let mut child = command
         .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -945,7 +952,10 @@ fn trim_audio_track_to_active_ranges(
 
     let filter = chain.join(";");
     let ffmpeg = find_ffmpeg_exe();
-    let status = Command::new(&ffmpeg)
+    let mut command = Command::new(&ffmpeg);
+    apply_no_window_flags(&mut command);
+
+    let status = command
         .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -980,7 +990,10 @@ fn mix_audio_tracks(
     output_path: &Path,
 ) -> Result<(), String> {
     let ffmpeg = find_ffmpeg_exe();
-    let status = Command::new(&ffmpeg)
+    let mut command = Command::new(&ffmpeg);
+    apply_no_window_flags(&mut command);
+
+    let status = command
         .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -1022,7 +1035,10 @@ fn mux_audio_into_raw_video(output_dir: &Path, audio_path: &Path) -> Result<(), 
 
     let muxed_path = output_dir.join("raw-with-audio.mp4");
     let ffmpeg = find_ffmpeg_exe();
-    let status = Command::new(&ffmpeg)
+    let mut command = Command::new(&ffmpeg);
+    apply_no_window_flags(&mut command);
+
+    let status = command
         .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -1250,7 +1266,10 @@ fn build_editor_proxy(output_dir: &std::path::Path) -> Result<Option<String>, St
     let proxy_name = "proxy-edit.mp4";
     let proxy_path = output_dir.join(proxy_name);
 
-    let status = std::process::Command::new(&ffmpeg)
+    let mut command = std::process::Command::new(&ffmpeg);
+    apply_no_window_flags(&mut command);
+
+    let status = command
         .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
