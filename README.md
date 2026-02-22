@@ -1,129 +1,148 @@
-# NeuroScreenCaster
+﻿# NeuroScreenCaster
 
-Рекордер экрана для Windows с архитектурой **Metadata-First** и движком **Smart Camera**. Записывайте экран, автоматически генерируйте «умные» зумы на основе телеметрии кликов/скролла, редактируйте таймлайн и экспортируйте готовое MP4 — без повторной записи.
+NeuroScreenCaster — desktop-приложение для записи экрана на Windows с архитектурой **Metadata-First**:
 
-Вдохновлен [Screen Studio](https://www.screen.studio/) и [CANVID](https://www.canvid.com/), реализован как open-source десктоп-приложение.
+- видео записывается отдельно от курсора,
+- телеметрия ввода (мышь/клавиатура/UI-context) сохраняется в `events.json`,
+- авто-зумы строятся постфактум через **Smart Camera Engine**,
+- результат можно редактировать на таймлайне и экспортировать в MP4.
 
-## Как это работает
+## Что изменилось в текущей версии
 
-1. **Запись** — захват чистого видеопотока (без системного курсора) через Windows Graphics Capture с параллельным логированием телеметрии мыши/клавиатуры и UI-контекста.
-2. **Анализ и редактирование** — авто-зум строит сегменты внимания и точки целей камеры (`targetPoints`) с учетом кликов, скролла и контекста UI. В редакторе доступна ручная правка сегментов и параметров курсора.
-3. **Smart Camera Preview** — предпросмотр считает камеру покадрово через spring physics (mass/stiffness/damping), поэтому переходы не «снэпятся» на резких изменениях цели.
-4. **Экспорт** — FFmpeg рендерит финальный MP4 с тем же spring-подходом камеры и виртуальным курсором, чтобы поведение совпадало с предпросмотром.
+- Старый модуль `auto_zoom.rs` удален.
+- Основной движок автозума: `src-tauri/src/algorithm/camera_engine.rs`.
+- В `ZoomSegment` добавлены:
+  - `mode`: `fixed` | `follow-cursor`
+  - `trigger`: `auto-click` | `auto-scroll` | `manual`
+- В редакторе можно переключать режим камеры для конкретного сегмента.
 
-## Возможности
+Подробная специфика текущего поведения: `GUIDE.md`.
 
-- Захват экрана через WGC (Windows Graphics Capture) без системного курсора
-- Глобальная телеметрия ввода: движение мыши, клики, скролл, клавиатура
-- UI Automation контекст при кликах (имя элемента, bounding rectangle)
-- Авто-зум с семантической кластеризацией кликов (контекст + дистанция + временной интервал)
-- State-based камера на spring physics вместо keyframes (mass/stiffness/damping)
-- Микро-трекинг курсора внутри активного зума («breathing edge panning»)
-- Интеграция скролла как смещения target, без отдельной keyframe-анимации pan
-- Строгий lock соотношения сторон target-области (без «растягивания» кадра)
-- Адаптивные fallback-правила для грубого/неполного UI-контекста (когда bounding rect слишком крупный)
-- Сглаживание траектории курсора (Ramer-Douglas-Peucker + Catmull-Rom сплайн)
-- Неразрушающий редактор таймлайна с ручной правкой зум-сегментов
-- Настраиваемый размер курсора, степень сглаживания и фон (сплошной/градиент)
-- Превью композиции в реальном времени с физической моделью камеры
-- Экспорт MP4 с индикатором прогресса
-- Поддержка High-DPI (масштабирование Windows 100/125/150%)
+## Автозумы: текущая логика
 
-## Стек технологий
+### 1. Базовый pipeline
+
+1. Во время записи сохраняются:
+   - `raw.mp4` (без системного курсора)
+   - `events.json` (move/click/scroll/key + UI context)
+2. После `Stop` вызывается `build_smart_camera_segments(...)`.
+3. Сегменты попадают в `project.json` -> `timeline.zoomSegments`.
+
+### 2. Триггеры
+
+- Активация по кликам: **минимум 2 клика в окне 3 секунды**.
+- Быстрые клики группируются: `<= 300ms` между кликами.
+- Антиспам: минимум `2s` между стартами новых auto-переходов.
+- Pre-roll до клика: до `400ms` при замедлении курсора.
+
+### 3. Фокус и кадрирование
+
+- Если у клика есть `uiContext.boundingRect`, камера фокусируется на нем (с padding).
+- Если `boundingRect` нет — fallback на клик с zoom `2.0x`.
+- Жесткий clamp зума: максимум `2.5x`.
+- Containment test: если новый target полностью внутри safe-zone текущего viewport, ретаргет не выполняется.
+
+### 4. Поведение камеры
+
+Состояния:
+
+- `FreeRoam`
+- `LockedFocus`
+
+`LockedFocus`:
+
+- камера залочена на фокус,
+- soft-zone в зуме не используется,
+- pan только при пробитии hard-edge,
+- scroll двигает `Y_target` синхронно с контентом,
+- глобальный scroll (`>3s` или `>150%` высоты экрана) выводит камеру обратно в общий контекст.
+
+### 5. Пружина
+
+- Фиксированный шаг интеграции: `8ms`.
+- Параметры по умолчанию:
+  - `mass=1`
+  - `stiffness=170`
+  - `damping=26`
+
+## Редактор
+
+Экран `Edit` (`src/screens/Edit.tsx`) поддерживает:
+
+- ручное создание/удаление сегментов,
+- изменение позиции и силы зума,
+- выбор режима сегмента:
+  - `Locked` (`fixed`)
+  - `Follow cursor` (`follow-cursor`)
+- предпросмотр камеры через spring-track,
+- редактирование параметров курсора.
+
+Для `follow-cursor` траектория target points генерируется в редакторе на основе курсора и сохраняется в проект при `Save`.
+
+## Технологии
 
 | Слой | Технология |
-|------|-----------|
-| Десктоп-оболочка | Rust + [Tauri v2](https://v2.tauri.app/) |
-| Захват экрана | [windows-capture](https://crates.io/crates/windows-capture) 1.5 (WGC) |
-| Хуки ввода | [rdev](https://crates.io/crates/rdev) |
-| UI-контекст | [uiautomation](https://crates.io/crates/uiautomation) |
-| Фронтенд | React 18 + TypeScript + Vite |
-| Композиция видео | FFmpeg filter graph + spring-выражения камеры |
-| Кодирование видео | FFmpeg (встроен как sidecar) |
+|---|---|
+| Desktop shell | Rust + Tauri v2 |
+| Screen capture | `windows-capture` (WGC) |
+| Input telemetry | `rdev` |
+| UI context | `uiautomation` |
+| Frontend | React 18 + TypeScript + Vite |
+| Export | FFmpeg (filter graph + spring camera) |
 
 ## Системные требования
 
-- **Windows 10/11** (WGC требует Windows 10 1903+)
-- **Node.js** 18+
-- **Rust** stable (через [rustup](https://rustup.rs/))
-- **Visual Studio Build Tools** с компонентом "C++ build tools" (необходим для компиляции Rust и нативных зависимостей)
-- **WebView2** (предустановлен в Windows 11; для Windows 10 — [скачать](https://developer.microsoft.com/en-us/microsoft-edge/webview2/))
-- **FFmpeg** — бинарник необходимо поместить в `src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe` (файл не входит в репозиторий, скачайте с [ffmpeg.org](https://ffmpeg.org/download.html) или [gyan.dev](https://www.gyan.dev/ffmpeg/builds/))
+- Windows 10/11 (WGC: Windows 10 1903+)
+- Node.js 18+
+- Rust stable (`rustup`)
+- Visual Studio Build Tools (`C++ build tools`)
+- WebView2
+- FFmpeg sidecar: `src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe`
 
 ## Установка и запуск
 
 ```bash
-# Клонировать репозиторий
 git clone https://github.com/your-username/NeuroScreenCaster.git
 cd NeuroScreenCaster
-
-# Установить фронтенд-зависимости
 npm install
-
-# Скачать FFmpeg и поместить в нужную директорию
-# (пример для PowerShell)
-# curl -L -o src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe https://...
-
-# Запуск в режиме разработки (Vite dev server + Tauri окно)
 npx @tauri-apps/cli dev
 ```
 
-> Rust-зависимости (crates) скачиваются автоматически при первой сборке через `cargo`.
-
-### Сборка релиза
+Сборка релиза:
 
 ```bash
-# Собрать релизный бинарник (результат в src-tauri/target/release/bundle/)
 npx @tauri-apps/cli build
 ```
 
-Установщик/исполняемый файл будет в `src-tauri/target/release/bundle/`.
-
 ## Структура проекта
 
-```
+```text
 NeuroScreenCaster/
-├── src/                        # React-фронтенд
-│   ├── screens/                # Экраны: Record, Edit, Export
-│   ├── components/             # UI-компоненты + модули алгоритмов
-│   └── types/                  # TypeScript-контракты (events.ts, project.ts)
-├── src-tauri/                  # Rust-бэкенд (Tauri)
+├── src/
+│   ├── screens/
+│   └── types/
+├── src-tauri/
 │   ├── src/
-│   │   ├── capture/            # WGC-рекордер + пайп в FFmpeg
-│   │   ├── telemetry/          # rdev-хуки + UI Automation контекст
-│   │   ├── commands/           # Tauri IPC обработчики команд
-│   │   ├── models/             # Rust-структуры данных (events, project)
-│   │   └── algorithm/          # Авто-зум + сглаживание курсора
-│   └── binaries/               # FFmpeg sidecar
-├── PLAN.md                     # План разработки (этапы 0–7)
-└── package.json
+│   │   ├── algorithm/
+│   │   │   ├── camera_engine.rs
+│   │   │   └── cursor_smoothing.rs
+│   │   ├── capture/
+│   │   ├── commands/
+│   │   ├── models/
+│   │   └── telemetry/
+│   └── binaries/
+├── GUIDE.md
+└── README.md
 ```
-
-## Формат записи
-
-Каждая запись создает папку в `{Видео}/NeuroScreenCaster/{recording_id}/`:
-
-| Файл | Описание |
-|------|----------|
-| `raw.mp4` | H.264 30fps захват экрана без курсора |
-| `project.json` | Метаданные проекта, таймлайн, параметры рендера |
-| `events.json` | Телеметрия ввода (мышь, клавиатура, UI-контекст) |
-
-## Использование
-
-1. **Запись** — выберите монитор и нажмите Start. Приложение записывает экран и события ввода одновременно. Нажмите Stop для завершения.
-2. **Редактирование** — откройте запись в редакторе. Зум-сегменты генерируются автоматически из кликов. Перетаскивайте сегменты на таймлайне, настраивайте размер курсора, сглаживание и стиль фона.
-3. **Экспорт** — задайте параметры и нажмите Export. Финальный MP4 рендерится с умной spring-камерой и виртуальным курсором.
 
 ## Скрипты
 
 | Команда | Описание |
-|---------|----------|
-| `npm run dev` | Запуск Vite dev-сервера |
-| `npm run build` | Сборка фронтенда (TypeScript + Vite) |
-| `npx @tauri-apps/cli dev` | Полная dev-среда (фронтенд + Tauri) |
-| `npx @tauri-apps/cli build` | Сборка релиза |
-| `npm run qa:smoke` | Smoke QA-проверки |
+|---|---|
+| `npm run dev` | Vite dev server |
+| `npm run build` | Сборка фронтенда |
+| `npx @tauri-apps/cli dev` | Полный dev-режим |
+| `npx @tauri-apps/cli build` | Сборка приложения |
 
 ## Лицензия
 

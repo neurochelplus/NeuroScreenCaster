@@ -101,7 +101,7 @@ impl Default for SmartCameraConfig {
         Self {
             fixed_dt_ms: 8,
             dead_zone_ratio: 0.40,
-            hard_edge_ratio: 0.45,
+            hard_edge_ratio: 0.35,
             hard_edge_pan_speed_px_per_s: 1_200.0,
             escape_distance_ratio: 0.80,
             scroll_shift_ratio: 0.10,
@@ -653,7 +653,7 @@ fn push_locked_segment(
         },
         pan_trajectory: Vec::new(),
         legacy_easing: None,
-        mode: ZoomMode::Fixed,
+        mode: ZoomMode::FollowCursor,
         trigger: ZoomTrigger::AutoClick,
         is_auto: true,
     });
@@ -700,6 +700,12 @@ fn build_focus_transitions(
             output_aspect_ratio,
             config,
         );
+        let zoom = clamp_locked_zoom(zoom, config);
+        let free_roam_zoom = config.free_roam_zoom.max(1.0);
+        // Ignore no-op transitions that keep full-frame context.
+        if zoom <= free_roam_zoom + 0.001 {
+            continue;
+        }
         let focus_rect = focus_rect_from_cluster(cluster, screen_width, screen_height);
         let cluster_tail_bonus_ms = if cluster.click_count > 1 { 250 } else { 0 };
         let min_cluster_end = cluster
@@ -1034,9 +1040,9 @@ fn apply_locked_hard_edge_pan(
         screen_height,
         output_aspect_ratio,
     );
-    let hard_edge_ratio = config.hard_edge_ratio.clamp(0.05, 0.49);
-    let hard_edge_x = (view_w * hard_edge_ratio).max(1.0 / width);
-    let hard_edge_y = (view_h * hard_edge_ratio).max(1.0 / height);
+    let hard_edge_ratio = config.hard_edge_ratio.clamp(0.05, 0.95);
+    let hard_edge_x = (view_w * 0.5 * hard_edge_ratio).max(1.0 / width);
+    let hard_edge_y = (view_h * 0.5 * hard_edge_ratio).max(1.0 / height);
     let max_step_x = (config.hard_edge_pan_speed_px_per_s.max(0.0) * dt_seconds.max(0.0)) / width;
     let max_step_y = (config.hard_edge_pan_speed_px_per_s.max(0.0) * dt_seconds.max(0.0)) / height;
 
@@ -1332,6 +1338,51 @@ mod tests {
             .expect("expected locked sample");
         assert!(locked.target_zoom <= cfg.max_zoom_limit + 0.000_1);
         assert!((locked.target_zoom - cfg.max_zoom_limit).abs() < 0.001);
+    }
+
+    #[test]
+    fn fullscreen_focus_is_ignored_before_real_zoom_transition() {
+        let events = vec![
+            click_with_bounds(
+                1_000,
+                960.0,
+                540.0,
+                Some(BoundingRect {
+                    x: 0,
+                    y: 0,
+                    width: 1_920,
+                    height: 1_080,
+                }),
+            ),
+            click_with_bounds(
+                2_000,
+                120.0,
+                200.0,
+                Some(BoundingRect {
+                    x: 80,
+                    y: 160,
+                    width: 120,
+                    height: 80,
+                }),
+            ),
+        ];
+        let cfg = SmartCameraConfig {
+            min_clicks_to_activate: 1,
+            ..SmartCameraConfig::default()
+        };
+        let segments = build_smart_camera_segments(&events, 1_920, 1_080, 3_000, 16.0 / 9.0, &cfg);
+        assert_eq!(segments.len(), 1, "expected only one effective auto-zoom segment");
+        let segment = &segments[0];
+        assert!(
+            segment.start_ts >= 1_600,
+            "segment should start near second click preroll window, got {}",
+            segment.start_ts
+        );
+        assert!(
+            segment.target_points.iter().any(|point| point.rect.width < 0.99),
+            "segment must contain actual zoom-in target points"
+        );
+        assert_eq!(segment.mode, ZoomMode::FollowCursor);
     }
 
     #[test]

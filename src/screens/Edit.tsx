@@ -78,9 +78,10 @@ const MIN_SEGMENT_MS = 200;
 const PLAYHEAD_STATE_SYNC_INTERVAL_MS = 120;
 const PREVIEW_SPRING_FPS = 60;
 const FOLLOW_SAMPLE_STEP_MS = 75;
-const FOLLOW_DEAD_ZONE_RATIO = 0.25;
-const FOLLOW_HARD_EDGE_RATIO = 0.45;
+const FOLLOW_DEAD_ZONE_RATIO = 0.2;
+const FOLLOW_HARD_EDGE_RATIO = 0.35;
 const FOLLOW_MAX_SPEED_PX_PER_S = 800;
+const EFFECTIVE_ZOOM_EPSILON = 0.001;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -106,9 +107,11 @@ function normalizeSegmentTrigger(trigger: ZoomTrigger | undefined, isAuto: boole
 }
 
 function normalizeZoomSegment(segment: ZoomSegment): ZoomSegment {
+  const normalizedMode = normalizeSegmentMode(segment.mode);
+  const mode: ZoomMode = segment.isAuto ? "follow-cursor" : normalizedMode;
   return {
     ...segment,
-    mode: normalizeSegmentMode(segment.mode),
+    mode,
     trigger: normalizeSegmentTrigger(segment.trigger, segment.isAuto),
   };
 }
@@ -407,8 +410,59 @@ function updateSegmentBaseRect(segment: ZoomSegment, rect: NormalizedRect): Zoom
   };
 }
 
+function trimAutoNoopSegment(segment: ZoomSegment): ZoomSegment | null {
+  if (!segment.isAuto) {
+    return segment;
+  }
+  const points = getSegmentTargetPoints(segment);
+  if (points.length === 0) {
+    return segment;
+  }
+
+  const firstEffectiveIndex = points.findIndex(
+    (point) => getZoomStrength(point.rect) > 1 + EFFECTIVE_ZOOM_EPSILON
+  );
+  if (firstEffectiveIndex < 0) {
+    return null;
+  }
+
+  const effectiveStartTs = clamp(points[firstEffectiveIndex].ts, segment.startTs, segment.endTs);
+  if (effectiveStartTs >= segment.endTs) {
+    return null;
+  }
+
+  const trimmedPoints: TargetPoint[] = points
+    .filter((point) => point.ts >= effectiveStartTs)
+    .map((point) => ({
+      ts: clamp(point.ts, effectiveStartTs, segment.endTs),
+      rect: normalizeRect(point.rect),
+    }));
+  if (trimmedPoints.length === 0) {
+    return null;
+  }
+
+  if (trimmedPoints[0].ts > effectiveStartTs) {
+    trimmedPoints.unshift({ ts: effectiveStartTs, rect: trimmedPoints[0].rect });
+  }
+  const lastPoint = trimmedPoints[trimmedPoints.length - 1];
+  if (lastPoint.ts < segment.endTs) {
+    trimmedPoints.push({ ts: segment.endTs, rect: lastPoint.rect });
+  }
+
+  return {
+    ...segment,
+    startTs: effectiveStartTs,
+    initialRect: trimmedPoints[0].rect,
+    targetPoints: trimmedPoints,
+  };
+}
+
 function sortSegments(segments: ZoomSegment[]): ZoomSegment[] {
-  return [...segments].map(normalizeZoomSegment).sort((a, b) => a.startTs - b.startTs);
+  return [...segments]
+    .map(normalizeZoomSegment)
+    .map(trimAutoNoopSegment)
+    .filter((segment): segment is ZoomSegment => segment !== null)
+    .sort((a, b) => a.startTs - b.startTs);
 }
 
 function formatMs(ms: number): string {
@@ -518,6 +572,16 @@ function interpolateCursor(samples: CursorSample[], ts: number): { x: number; y:
 
 function getZoomStrength(rect: NormalizedRect): number {
   return 1 / Math.max(rect.width, rect.height);
+}
+
+function getSegmentDisplayZoom(segment: ZoomSegment): number {
+  const normalized = normalizeZoomSegment(segment);
+  const baseZoom = getZoomStrength(getSegmentBaseRect(normalized));
+  let maxZoom = baseZoom;
+  for (const point of getSegmentTargetPoints(normalized)) {
+    maxZoom = Math.max(maxZoom, getZoomStrength(point.rect));
+  }
+  return maxZoom;
 }
 
 function buildRectFromCenterZoom(
@@ -631,10 +695,10 @@ function buildFollowCursorTargetPoints(
     const cursor = interpolateCursor(cursorSamples, ts);
     const offsetX = cursor.x - centerX;
     const offsetY = cursor.y - centerY;
-    const deadX = baseRect.width * deadRatio;
-    const deadY = baseRect.height * deadRatio;
-    const hardX = baseRect.width * hardRatio;
-    const hardY = baseRect.height * hardRatio;
+    const deadX = baseRect.width * 0.5 * deadRatio;
+    const deadY = baseRect.height * 0.5 * deadRatio;
+    const hardX = baseRect.width * 0.5 * hardRatio;
+    const hardY = baseRect.height * 0.5 * hardRatio;
 
     if (Math.abs(offsetX) > deadX) {
       const excess = Math.abs(offsetX) - deadX;
@@ -1813,7 +1877,7 @@ export default function EditScreen() {
                           return null;
                         }
                         const isSelected = selectedSegmentId === visual.id;
-                        const zoom = getZoomStrength(getSegmentBaseRect(segment));
+                        const zoom = getSegmentDisplayZoom(segment);
                         const modeLabel =
                           normalizeSegmentMode(segment.mode) === "follow-cursor" ? "Follow" : "Locked";
 

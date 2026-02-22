@@ -173,7 +173,7 @@ fn save_recording_files(
     };
 
     log::info!(
-        "save_recording_files: auto_zoom_segments={} smoothed_cursor_points={} proxy={}",
+        "save_recording_files: smart_camera_segments={} smoothed_cursor_points={} proxy={}",
         zoom_segments.len(),
         smoothed_cursor_path.len(),
         proxy_video_path.as_deref().unwrap_or("none")
