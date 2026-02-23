@@ -417,26 +417,32 @@ pub fn process_camera_targets(
                 cluster_end_ts,
             } = state
             {
-                let viewport = current_viewport_rect(
-                    spring_x.current_pos,
-                    spring_y.current_pos,
-                    spring_z.current_pos,
-                    screen_width,
-                    screen_height,
-                    safe_aspect,
+                let keep_locked_target_on_inside_click = matches!(
+                    config.click_activation_mode,
+                    ClickActivationMode::MultiClickWindow
                 );
-                let safe_zone = inset_rect(viewport, config.safe_zone_margin_ratio);
-                if safe_zone.contains(focus.focus_rect) {
-                    state = CameraState::LockedFocus {
-                        focus_center_x,
-                        focus_center_y,
-                        focus_zoom,
-                        cluster_end_ts: cluster_end_ts
-                            .max(focus.cluster_end_ts)
-                            .max(focus.trigger_ts),
-                    };
-                    transition_idx += 1;
-                    continue;
+                if keep_locked_target_on_inside_click {
+                    let viewport = current_viewport_rect(
+                        spring_x.current_pos,
+                        spring_y.current_pos,
+                        spring_z.current_pos,
+                        screen_width,
+                        screen_height,
+                        safe_aspect,
+                    );
+                    let safe_zone = inset_rect(viewport, config.safe_zone_margin_ratio);
+                    if safe_zone.contains(focus.focus_rect) {
+                        state = CameraState::LockedFocus {
+                            focus_center_x,
+                            focus_center_y,
+                            focus_zoom,
+                            cluster_end_ts: cluster_end_ts
+                                .max(focus.cluster_end_ts)
+                                .max(focus.trigger_ts),
+                        };
+                        transition_idx += 1;
+                        continue;
+                    }
                 }
             }
 
@@ -713,15 +719,35 @@ fn build_focus_transitions(
             }
         }
 
-        let (center_x, center_y, zoom) = semantic_target_from_cluster(
+        let (mut center_x, mut center_y, mut zoom) = semantic_target_from_cluster(
             cluster,
             screen_width,
             screen_height,
             output_aspect_ratio,
             config,
         );
-        let zoom = clamp_locked_zoom(zoom, config);
+        zoom = clamp_locked_zoom(zoom, config);
         let free_roam_zoom = config.free_roam_zoom.max(1.0);
+        // For strict click modes, fallback to click-centered zoom when semantic bounds
+        // result in a no-op full-frame target.
+        if zoom <= free_roam_zoom + 0.001
+            && matches!(
+                config.click_activation_mode,
+                ClickActivationMode::SingleClick | ClickActivationMode::CtrlClick
+            )
+        {
+            let fallback = fallback_target(
+                cluster.anchor_x,
+                cluster.anchor_y,
+                screen_width,
+                screen_height,
+                output_aspect_ratio,
+                config,
+            );
+            center_x = fallback.0;
+            center_y = fallback.1;
+            zoom = clamp_locked_zoom(fallback.2, config);
+        }
         // Ignore no-op transitions that keep full-frame context.
         if zoom <= free_roam_zoom + 0.001 {
             continue;

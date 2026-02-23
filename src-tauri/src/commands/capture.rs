@@ -420,10 +420,16 @@ fn camera_config_for_trigger_mode(
     match auto_zoom_trigger_mode {
         AutoZoomTriggerMode::SingleClick | AutoZoomTriggerMode::CtrlClick => {
             config.min_clicks_to_activate = 1;
+            // "Single click" / "Ctrl+click" should react to each valid click,
+            // so disable long coalescing/debouncing defaults.
+            config.click_cluster_gap_ms = 1;
+            config.min_zoom_interval_ms = 1;
         }
         AutoZoomTriggerMode::MultiClickWindow => {
             config.min_clicks_to_activate = 2;
             config.activation_window_ms = 3_000;
+            config.click_cluster_gap_ms = 300;
+            config.min_zoom_interval_ms = 2_000;
         }
     }
 
