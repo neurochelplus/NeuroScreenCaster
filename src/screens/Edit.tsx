@@ -41,6 +41,15 @@ interface TimelineSegmentVisual {
   isAuto: boolean;
 }
 
+interface RawTimelineSegmentVisual {
+  id: string;
+  startPreviewMs: number;
+  endPreviewMs: number;
+  leftPx: number;
+  naturalWidthPx: number;
+  isAuto: boolean;
+}
+
 type SegmentDragMode = "move" | "start" | "end";
 
 interface SegmentDragState {
@@ -86,12 +95,21 @@ const CURSOR_SIZE_TO_FRAME_RATIO = 0.03;
 const CLICK_PULSE_MIN_SCALE = 0.82;
 const CLICK_PULSE_TOTAL_MS = 150;
 const CLICK_PULSE_DOWN_MS = 65;
+const CURSOR_TIMING_OFFSET_MS = 45;
 const VECTOR_CURSOR_WIDTH = 72;
 const VECTOR_CURSOR_HEIGHT = 110;
 const TIMELINE_MIN_ZOOM_PERCENT = 0;
 const TIMELINE_MAX_ZOOM_PERCENT = 100;
 const TIMELINE_DEFAULT_ZOOM_PERCENT = 50;
 const TIMELINE_MAX_VISIBLE_WINDOW_MS = 10_000;
+const TIMELINE_LABEL_WIDTH_PX = 72;
+const TIMELINE_LANE_RIGHT_MARGIN_PX = 8;
+const TIMELINE_MIN_SEGMENT_WIDTH_PX = 2;
+const TIMELINE_MIN_VISIBLE_SEGMENT_WIDTH_PX = 1;
+const TIMELINE_VISUAL_ZOOM_EPSILON = 0.0002;
+const TIMELINE_VISUAL_MOTION_EPSILON = 0.00005;
+const MIN_SEGMENT_GAP_MS = 200;
+const TIMELINE_VISUAL_RETURN_TAIL_MS = 200;
 const VECTOR_CURSOR_DATA_URI = `data:image/svg+xml;utf8,${encodeURIComponent(
   "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 72 110'><path d='M0 0 L0 90 L22 70 L35 110 L50 102 L38 63 L72 63 Z' fill='#000000' stroke='#ffffff' stroke-width='6' stroke-linejoin='round'/></svg>"
 )}`;
@@ -388,22 +406,27 @@ function buildSpringCameraTrack(
   }
 
   const stepMs = 1000 / Math.max(1, fps);
-  const frameCount = Math.max(1, Math.ceil(durationMs / stepMs));
-  const samples: SpringCameraSample[] = [];
+  const samples: SpringCameraSample[] = [{ ts: 0, rect: FULL_RECT }];
   let rect = { ...FULL_RECT };
   let vx = 0;
   let vy = 0;
   let vw = 0;
   let vh = 0;
   let previousTs = 0;
+  let frame = 1;
 
-  for (let frame = 0; frame <= frameCount; frame += 1) {
+  while (previousTs < durationMs) {
     const ts = Math.min(Math.round(frame * stepMs), durationMs);
-    const activeSegment = resolveRuntimeSegment(runtimeSegments, ts);
-    const targetRect = activeSegment ? getTargetRectAtTs(activeSegment, ts) : FULL_RECT;
+    frame += 1;
+    if (ts <= previousTs) {
+      continue;
+    }
+    // Integrate using target sampled at the start of the interval [previousTs, ts].
+    // This keeps segment boundaries aligned with timeline bars.
+    const activeSegment = resolveRuntimeSegment(runtimeSegments, previousTs);
+    const targetRect = activeSegment ? getTargetRectAtTs(activeSegment, previousTs) : FULL_RECT;
     const spring = activeSegment?.spring ?? DEFAULT_SPRING;
     const dtSeconds = (ts - previousTs) / 1000;
-    previousTs = ts;
 
     const stepX = springStep(rect.x, vx, targetRect.x, spring, dtSeconds);
     rect.x = stepX.value;
@@ -423,6 +446,7 @@ function buildSpringCameraTrack(
 
     rect = normalizeRect(rect);
     samples.push({ ts, rect });
+    previousTs = ts;
   }
 
   return samples;
@@ -464,6 +488,132 @@ function sampleCameraTrack(track: SpringCameraSample[], ts: number): NormalizedR
     width: prev.rect.width + (next.rect.width - prev.rect.width) * t,
     height: prev.rect.height + (next.rect.height - prev.rect.height) * t,
   });
+}
+
+function findTrackIndexAtOrAfter(track: SpringCameraSample[], ts: number): number {
+  if (track.length === 0) {
+    return -1;
+  }
+  if (ts <= track[0].ts) {
+    return 0;
+  }
+  let low = 0;
+  let high = track.length - 1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (track[mid].ts < ts) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return Math.min(low, track.length - 1);
+}
+
+function findTrackIndexAtOrBefore(track: SpringCameraSample[], ts: number): number {
+  if (track.length === 0) {
+    return -1;
+  }
+  if (ts >= track[track.length - 1].ts) {
+    return track.length - 1;
+  }
+  let low = 0;
+  let high = track.length - 1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (track[mid].ts <= ts) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return Math.max(0, high);
+}
+
+function resolveSegmentVisualBounds(
+  segment: RuntimeSegment,
+  track: SpringCameraSample[]
+): { startTs: number; endTs: number } {
+  if (track.length === 0) {
+    return { startTs: segment.startTs, endTs: segment.endTs };
+  }
+
+  const rangeStart = findTrackIndexAtOrAfter(track, segment.startTs);
+  const rangeEnd = findTrackIndexAtOrBefore(track, segment.endTs);
+  if (rangeStart < 0 || rangeEnd < rangeStart) {
+    return { startTs: segment.startTs, endTs: segment.endTs };
+  }
+
+  const motionDelta = (left: NormalizedRect, right: NormalizedRect) =>
+    Math.max(
+      Math.abs(left.x - right.x),
+      Math.abs(left.y - right.y),
+      Math.abs(left.width - right.width),
+      Math.abs(left.height - right.height)
+    );
+  const isVisuallyActiveAt = (index: number) => {
+    const sample = track[index];
+    if (getZoomStrength(sample.rect) > 1 + TIMELINE_VISUAL_ZOOM_EPSILON) {
+      return true;
+    }
+    if (index > 0) {
+      return motionDelta(sample.rect, track[index - 1].rect) > TIMELINE_VISUAL_MOTION_EPSILON;
+    }
+    return false;
+  };
+
+  let peakIndex = rangeStart;
+  let peakZoom = 1;
+  for (let index = rangeStart; index <= rangeEnd; index += 1) {
+    const zoom = getZoomStrength(track[index].rect);
+    if (zoom > peakZoom) {
+      peakZoom = zoom;
+      peakIndex = index;
+    }
+  }
+
+  if (peakZoom <= 1 + TIMELINE_VISUAL_ZOOM_EPSILON) {
+    const firstMoving = (() => {
+      for (let index = rangeStart; index <= rangeEnd; index += 1) {
+        if (isVisuallyActiveAt(index)) {
+          return index;
+        }
+      }
+      return -1;
+    })();
+    if (firstMoving >= 0) {
+      peakIndex = firstMoving;
+    } else {
+      return { startTs: segment.startTs, endTs: segment.endTs };
+    }
+  }
+
+  let visualStartIndex = peakIndex;
+  while (visualStartIndex > 0 && isVisuallyActiveAt(visualStartIndex - 1)) {
+    visualStartIndex -= 1;
+  }
+
+  let visualEndIndex = peakIndex;
+  while (visualEndIndex + 1 < track.length && isVisuallyActiveAt(visualEndIndex + 1)) {
+    visualEndIndex += 1;
+  }
+
+  let startTs = track[visualStartIndex].ts;
+  const endTs = track[visualEndIndex].ts;
+  // Keep manual bars responsive: if a segment starts before noticeable zoom delta,
+  // anchor the visual start to the segment boundary instead of lagging behind.
+  if (segment.startTs < startTs) {
+    startTs = segment.startTs;
+  }
+
+  if (endTs <= startTs) {
+    return { startTs: segment.startTs, endTs: segment.endTs };
+  }
+
+  return {
+    startTs,
+    endTs,
+  };
 }
 
 function updateSegmentBaseRect(segment: ZoomSegment, rect: NormalizedRect): ZoomSegment {
@@ -530,6 +680,78 @@ function sortSegments(segments: ZoomSegment[]): ZoomSegment[] {
     .map(trimAutoNoopSegment)
     .filter((segment): segment is ZoomSegment => segment !== null)
     .sort((a, b) => a.startTs - b.startTs);
+}
+
+function getSegmentNeighborBounds(
+  segments: ZoomSegment[],
+  segmentId: string,
+  timelineDurationMs: number
+): { prevEndTs: number; nextStartTs: number } {
+  const sorted = [...segments].sort((a, b) => a.startTs - b.startTs);
+  const index = sorted.findIndex((segment) => segment.id === segmentId);
+  if (index < 0) {
+    return {
+      prevEndTs: 0,
+      nextStartTs: Math.max(0, timelineDurationMs),
+    };
+  }
+
+  return {
+    prevEndTs: index > 0 ? sorted[index - 1].endTs : 0,
+    nextStartTs:
+      index + 1 < sorted.length ? sorted[index + 1].startTs : Math.max(0, timelineDurationMs),
+  };
+}
+
+function findAvailableGapForSegment(
+  segments: ZoomSegment[],
+  timelineDurationMs: number,
+  preferredStartTs: number
+): { startTs: number; endTs: number } | null {
+  const safeDuration = Math.max(0, timelineDurationMs);
+  if (safeDuration < MIN_SEGMENT_MS) {
+    return null;
+  }
+
+  const sorted = [...segments].sort((a, b) => a.startTs - b.startTs);
+  const gaps: Array<{ start: number; end: number }> = [];
+  let cursor = 0;
+  for (const segment of sorted) {
+    const segStart = clamp(segment.startTs, 0, safeDuration);
+    const segEnd = clamp(segment.endTs, 0, safeDuration);
+    if (segStart > cursor) {
+      const gapStart = cursor <= 0 ? 0 : cursor + MIN_SEGMENT_GAP_MS;
+      const gapEnd = segStart - MIN_SEGMENT_GAP_MS;
+      if (gapEnd - gapStart >= MIN_SEGMENT_MS) {
+        gaps.push({ start: gapStart, end: gapEnd });
+      }
+    }
+    cursor = Math.max(cursor, segEnd);
+  }
+  if (cursor < safeDuration) {
+    const gapStart = cursor <= 0 ? 0 : cursor + MIN_SEGMENT_GAP_MS;
+    if (safeDuration - gapStart >= MIN_SEGMENT_MS) {
+      gaps.push({ start: gapStart, end: safeDuration });
+    }
+  }
+
+  const preferred = clamp(preferredStartTs, 0, safeDuration - MIN_SEGMENT_MS);
+  const preferredGap =
+    gaps.find((gap) => gap.end - gap.start >= MIN_SEGMENT_MS && preferred < gap.end) ?? null;
+  if (!preferredGap) {
+    return null;
+  }
+
+  const gapStart = preferredGap.start;
+  const gapEnd = preferredGap.end;
+  let startTs = clamp(preferred, gapStart, Math.max(gapStart, gapEnd - MIN_SEGMENT_MS));
+  let endTs = Math.min(startTs + 1600, gapEnd);
+  if (endTs - startTs < MIN_SEGMENT_MS) {
+    startTs = Math.max(gapStart, gapEnd - MIN_SEGMENT_MS);
+    endTs = gapEnd;
+  }
+
+  return { startTs, endTs };
 }
 
 function formatMs(ms: number): string {
@@ -982,17 +1204,29 @@ export default function EditScreen() {
     return Math.round(fullDurationMs - (fullDurationMs - maxZoomVisibleMs) * progress);
   }, [previewDurationMs, timelineZoomPercent]);
 
-  const timelineContentWidthPx = useMemo(() => {
-    const viewportWidthPx = Math.max(1, timelineViewportWidthPx || 900);
+  const timelineLaneViewportWidthPx = useMemo(
+    () =>
+      Math.max(
+        1,
+        (timelineViewportWidthPx || 900) - TIMELINE_LABEL_WIDTH_PX - TIMELINE_LANE_RIGHT_MARGIN_PX
+      ),
+    [timelineViewportWidthPx]
+  );
+
+  const timelineLaneContentWidthPx = useMemo(() => {
+    const viewportWidthPx = Math.max(1, timelineLaneViewportWidthPx || 1);
     if (previewDurationMs <= 0) {
       return viewportWidthPx;
     }
     const visibleWindowMs = clamp(timelineVisibleWindowMs, 1, previewDurationMs);
     const scaled = Math.round((previewDurationMs / visibleWindowMs) * viewportWidthPx);
     return Math.max(viewportWidthPx, scaled);
-  }, [previewDurationMs, timelineViewportWidthPx, timelineVisibleWindowMs]);
+  }, [previewDurationMs, timelineLaneViewportWidthPx, timelineVisibleWindowMs]);
 
-  const pxPerPreviewMs = timelineContentWidthPx / Math.max(previewDurationMs, 1);
+  const timelineContentWidthPx =
+    timelineLaneContentWidthPx + TIMELINE_LABEL_WIDTH_PX + TIMELINE_LANE_RIGHT_MARGIN_PX;
+
+  const pxPerPreviewMs = timelineLaneContentWidthPx / Math.max(previewDurationMs, 1);
 
   const timelineSegments = useMemo(
     () => sortSegments(project?.timeline.zoomSegments ?? []),
@@ -1052,6 +1286,10 @@ export default function EditScreen() {
     () => buildSpringCameraTrack(runtimeSegments, timelineDurationMs),
     [runtimeSegments, timelineDurationMs]
   );
+  const runtimeSegmentsById = useMemo(
+    () => new Map(runtimeSegments.map((segment) => [segment.id, segment])),
+    [runtimeSegments]
+  );
 
   const renderPreviewFrame = useCallback(
     (previewMs: number) => {
@@ -1062,6 +1300,11 @@ export default function EditScreen() {
       const clampedPreviewMs = clamp(previewMs, 0, previewDurationMs);
       playheadRef.current = clampedPreviewMs;
       const timelineMs = mapTimeMs(clampedPreviewMs, previewDurationMs, timelineDurationMs);
+      const cursorTimelineMs = clamp(
+        timelineMs + CURSOR_TIMING_OFFSET_MS,
+        0,
+        timelineDurationMs
+      );
       const rect = sampleCameraTrack(previewCameraTrack, timelineMs);
       const scale = 1 / Math.max(rect.width, rect.height);
       const centerX = rect.x + rect.width / 2;
@@ -1076,12 +1319,12 @@ export default function EditScreen() {
       }
 
       if (cursorRef.current) {
-        const cursor = interpolateCursor(cursorSamples, timelineMs);
+        const cursor = interpolateCursor(cursorSamples, cursorTimelineMs);
         const cursorVideoX = cursor.x * previewFrameSize.width;
         const cursorVideoY = cursor.y * previewFrameSize.height;
         const cursorX = cursorVideoX * scale + txPx;
         const cursorY = cursorVideoY * scale + tyPx;
-        const cursorPulseScale = sampleClickPulseScale(clickTimestamps, timelineMs);
+        const cursorPulseScale = sampleClickPulseScale(clickTimestamps, cursorTimelineMs);
         const cursorScale = Math.max(0.25, scale) * cursorPulseScale;
         const topLeftX = cursorX - previewCursorHotspotPx.x;
         const topLeftY = cursorY - previewCursorHotspotPx.y;
@@ -1091,7 +1334,9 @@ export default function EditScreen() {
       }
 
       if (timelinePlayheadRef.current) {
-        const leftPx = clamp(clampedPreviewMs * pxPerPreviewMs, 0, timelineContentWidthPx);
+        const leftPx =
+          TIMELINE_LABEL_WIDTH_PX +
+          clamp(clampedPreviewMs * pxPerPreviewMs, 0, timelineLaneContentWidthPx);
         timelinePlayheadRef.current.style.transform = `translate3d(${(leftPx - 1).toFixed(
           2
         )}px, 0, 0)`;
@@ -1107,6 +1352,7 @@ export default function EditScreen() {
       previewCursorHotspotPx.x,
       previewCursorHotspotPx.y,
       pxPerPreviewMs,
+      timelineLaneContentWidthPx,
       timelineContentWidthPx,
       timelineDurationMs,
     ]
@@ -1117,22 +1363,75 @@ export default function EditScreen() {
       return [];
     }
 
-    return timelineSegments.map((segment) => {
-      const startPreviewMs = mapTimeMs(segment.startTs, timelineDurationMs, previewDurationMs);
-      const endPreviewMs = mapTimeMs(segment.endTs, timelineDurationMs, previewDurationMs);
-      const leftPx = clamp(startPreviewMs * pxPerPreviewMs, 0, timelineContentWidthPx);
-      const widthPx = Math.max((endPreviewMs - startPreviewMs) * pxPerPreviewMs, 20);
+    const rawVisuals: RawTimelineSegmentVisual[] = timelineSegments.map((segment) => {
+      const runtime = runtimeSegmentsById.get(segment.id);
+      const visualBounds = runtime
+        ? resolveSegmentVisualBounds(runtime, previewCameraTrack)
+        : { startTs: segment.startTs, endTs: segment.endTs };
+      let startTs = clamp(visualBounds.startTs, segment.startTs, timelineDurationMs);
+      let endTs = clamp(visualBounds.endTs, startTs + 1, timelineDurationMs);
+      const maxOwnTailEndTs = Math.min(
+        timelineDurationMs,
+        segment.endTs + TIMELINE_VISUAL_RETURN_TAIL_MS
+      );
+      endTs = clamp(endTs, startTs + 1, Math.max(startTs + 1, maxOwnTailEndTs));
+      if (endTs <= startTs) {
+        startTs = clamp(segment.startTs, 0, timelineDurationMs);
+        endTs = clamp(
+          Math.max(segment.endTs, startTs + 1),
+          startTs + 1,
+          timelineDurationMs
+        );
+      }
+
+      const startPreviewMs = mapTimeMs(startTs, timelineDurationMs, previewDurationMs);
+      const endPreviewMs = mapTimeMs(endTs, timelineDurationMs, previewDurationMs);
+      const leftPx = clamp(startPreviewMs * pxPerPreviewMs, 0, timelineLaneContentWidthPx);
+      const naturalWidthPx = Math.max(
+        (endPreviewMs - startPreviewMs) * pxPerPreviewMs,
+        TIMELINE_MIN_VISIBLE_SEGMENT_WIDTH_PX
+      );
 
       return {
         id: segment.id,
         startPreviewMs,
         endPreviewMs,
         leftPx,
-        widthPx,
+        naturalWidthPx,
         isAuto: segment.isAuto,
       };
     });
-  }, [project, previewDurationMs, timelineDurationMs, timelineSegments, pxPerPreviewMs, timelineContentWidthPx]);
+
+    return rawVisuals.map((visual) => {
+      const leftPx = Math.max(0, visual.leftPx);
+      let widthPx = Math.max(visual.naturalWidthPx, TIMELINE_MIN_SEGMENT_WIDTH_PX);
+
+      const maxVisibleWidthPx = Math.max(
+        TIMELINE_MIN_VISIBLE_SEGMENT_WIDTH_PX,
+        timelineLaneContentWidthPx - leftPx
+      );
+      widthPx = Math.min(widthPx, maxVisibleWidthPx);
+
+      return {
+        id: visual.id,
+        startPreviewMs: visual.startPreviewMs,
+        endPreviewMs: visual.endPreviewMs,
+        leftPx,
+        widthPx,
+        isAuto: visual.isAuto,
+      };
+    });
+  }, [
+    project,
+    previewDurationMs,
+    timelineDurationMs,
+    timelineSegments,
+    pxPerPreviewMs,
+    previewCameraTrack,
+    runtimeSegmentsById,
+    timelineLaneContentWidthPx,
+    timelineContentWidthPx,
+  ]);
 
   const markerStepMs = useMemo(() => chooseMarkerStepMs(pxPerPreviewMs), [pxPerPreviewMs]);
   const timelineMarkers = useMemo(() => {
@@ -1144,17 +1443,19 @@ export default function EditScreen() {
     for (let ms = 0; ms <= previewDurationMs; ms += markerStepMs) {
       markers.push({
         ms,
-        leftPx: clamp(ms * pxPerPreviewMs, 0, timelineContentWidthPx),
+        leftPx:
+          TIMELINE_LABEL_WIDTH_PX +
+          clamp(ms * pxPerPreviewMs, 0, timelineLaneContentWidthPx),
       });
     }
     if (markers[markers.length - 1]?.ms !== previewDurationMs) {
       markers.push({
         ms: previewDurationMs,
-        leftPx: timelineContentWidthPx,
+        leftPx: TIMELINE_LABEL_WIDTH_PX + timelineLaneContentWidthPx,
       });
     }
     return markers;
-  }, [previewDurationMs, markerStepMs, pxPerPreviewMs, timelineContentWidthPx]);
+  }, [previewDurationMs, markerStepMs, pxPerPreviewMs, timelineLaneContentWidthPx]);
 
   const updateProject = (updater: (current: Project) => Project) => {
     setProject((current) => (current ? updater(current) : current));
@@ -1447,6 +1748,12 @@ export default function EditScreen() {
           return current;
         }
 
+        const neighbors = getSegmentNeighborBounds(
+          current.timeline.zoomSegments,
+          drag.segmentId,
+          timelineDurationMs
+        );
+
         const nextSegments = current.timeline.zoomSegments.map((segment) => {
           if (segment.id !== drag.segmentId) {
             return segment;
@@ -1454,7 +1761,19 @@ export default function EditScreen() {
 
           if (drag.mode === "move") {
             const length = drag.initialEndTs - drag.initialStartTs;
-            const startTs = clamp(drag.initialStartTs + deltaTimelineMs, 0, Math.max(0, timelineDurationMs - length));
+            const rawStartTs = drag.initialStartTs + deltaTimelineMs;
+            const minStartTs = Math.max(0, neighbors.prevEndTs + MIN_SEGMENT_GAP_MS);
+            const maxStartTs = Math.min(
+              Math.max(0, timelineDurationMs - length),
+              Math.max(minStartTs, neighbors.nextStartTs - MIN_SEGMENT_GAP_MS - length)
+            );
+            if (maxStartTs < minStartTs) {
+              return {
+                ...segment,
+                isAuto: false,
+              };
+            }
+            const startTs = clamp(rawStartTs, minStartTs, maxStartTs);
             return {
               ...segment,
               startTs,
@@ -1464,24 +1783,32 @@ export default function EditScreen() {
           }
 
           if (drag.mode === "start") {
+            const rawStartTs = drag.initialStartTs + deltaTimelineMs;
+            const minStartTs = Math.max(0, neighbors.prevEndTs + MIN_SEGMENT_GAP_MS);
+            const hardMaxStartTs = drag.initialEndTs - 1;
+            const preferredMaxStartTs = drag.initialEndTs - MIN_SEGMENT_MS;
+            const maxStartTs = Math.max(
+              minStartTs,
+              Math.min(hardMaxStartTs, preferredMaxStartTs)
+            );
             return {
               ...segment,
-              startTs: clamp(
-                drag.initialStartTs + deltaTimelineMs,
-                0,
-                Math.max(0, drag.initialEndTs - MIN_SEGMENT_MS)
-              ),
+              startTs: clamp(rawStartTs, minStartTs, maxStartTs),
               isAuto: false,
             };
           }
 
+          const rawEndTs = drag.initialEndTs + deltaTimelineMs;
+          const hardMinEndTs = drag.initialStartTs + 1;
+          const preferredMinEndTs = drag.initialStartTs + MIN_SEGMENT_MS;
+          const maxEndTs = Math.min(timelineDurationMs, neighbors.nextStartTs - MIN_SEGMENT_GAP_MS);
+          const minEndTs = Math.min(
+            Math.max(hardMinEndTs, preferredMinEndTs),
+            Math.max(hardMinEndTs, maxEndTs)
+          );
           return {
             ...segment,
-            endTs: clamp(
-              drag.initialEndTs + deltaTimelineMs,
-              drag.initialStartTs + MIN_SEGMENT_MS,
-              timelineDurationMs
-            ),
+            endTs: clamp(rawEndTs, minEndTs, Math.max(minEndTs, maxEndTs)),
             isAuto: false,
           };
         });
@@ -1559,12 +1886,16 @@ export default function EditScreen() {
     }
 
     const livePlayheadTimelineMs = mapTimeMs(playheadRef.current, previewDurationMs, timelineDurationMs);
-    const startTs = clamp(
-      livePlayheadTimelineMs,
-      0,
-      Math.max(0, timelineDurationMs - MIN_SEGMENT_MS)
+    const slot = findAvailableGapForSegment(
+      project.timeline.zoomSegments,
+      timelineDurationMs,
+      livePlayheadTimelineMs
     );
-    const endTs = clamp(startTs + 1600, startTs + MIN_SEGMENT_MS, timelineDurationMs);
+    if (!slot) {
+      setError("No free space on timeline for a new zoom segment.");
+      return;
+    }
+    const { startTs, endTs } = slot;
     const nextId = `manual-${Date.now()}`;
     const rect = sampleCameraTrack(previewCameraTrack, livePlayheadTimelineMs) ?? DEFAULT_RECT;
 
@@ -1692,7 +2023,14 @@ export default function EditScreen() {
       return;
     }
 
-    const rect = event.currentTarget.getBoundingClientRect();
+    const lane =
+      (target.closest(".timeline-row-lane") as HTMLElement | null) ??
+      (event.currentTarget.querySelector(".timeline-row-lane") as HTMLElement | null);
+    if (!lane) {
+      return;
+    }
+
+    const rect = lane.getBoundingClientRect();
     const localX = clamp(event.clientX - rect.left, 0, rect.width);
     const nextMs = Math.round((localX / Math.max(rect.width, 1)) * previewDurationMs);
     seekToPreviewMs(nextMs);

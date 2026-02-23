@@ -372,8 +372,10 @@ pub fn process_camera_targets(
                     cluster_end_ts,
                 } = state
                 {
-                    let mut next_center_y = focus_center_y
-                        - normalize_scroll_delta(delta.dy) * config.scroll_shift_ratio;
+                    let safe_zoom = clamp_locked_zoom(focus_zoom, config).max(1.0);
+                    let shift_normalized = (delta.dy / height) / safe_zoom;
+                    let mut next_center_y =
+                        focus_center_y - shift_normalized * config.scroll_shift_ratio.max(0.0);
                     let (view_w, view_h) = viewport_size_from_zoom(
                         focus_zoom,
                         screen_width,
@@ -473,13 +475,23 @@ pub fn process_camera_targets(
                 focus_zoom,
                 cluster_end_ts,
             } => {
-                let distance_px =
-                    (cursor_x - focus_center_x * width).hypot(cursor_y - focus_center_y * height);
-                let escape_threshold = width.hypot(height) * config.escape_distance_ratio.max(0.0);
                 let timed_out =
                     ts > cluster_end_ts.saturating_add(config.lock_recent_window_ms.max(1));
+                let (view_w, view_h) = viewport_size_from_zoom(
+                    clamp_locked_zoom(focus_zoom, config),
+                    screen_width,
+                    screen_height,
+                    safe_aspect,
+                );
+                let cursor_nx = (cursor_x / width).clamp(0.0, 1.0);
+                let cursor_ny = (cursor_y / height).clamp(0.0, 1.0);
+                let escape_margin = locked_escape_margin_ratio(config.escape_distance_ratio);
+                let is_escaped = cursor_nx < focus_center_x - view_w * 0.5 - escape_margin
+                    || cursor_nx > focus_center_x + view_w * 0.5 + escape_margin
+                    || cursor_ny < focus_center_y - view_h * 0.5 - escape_margin
+                    || cursor_ny > focus_center_y + view_h * 0.5 + escape_margin;
 
-                if timed_out || distance_px > escape_threshold {
+                if timed_out || is_escaped {
                     state = CameraState::FreeRoam;
                     target_center_x = free_roam_center_x;
                     target_center_y = free_roam_center_y;
@@ -692,9 +704,12 @@ fn build_focus_transitions(
     let mut last_transition_start: Option<u64> = None;
     for cluster in clusters {
         let start_ts = choose_preroll_start(cluster.start_ts, velocities, config);
+        let mut actual_start_ts = start_ts;
         if let Some(last_start) = last_transition_start {
-            if start_ts.saturating_sub(last_start) < config.min_zoom_interval_ms.max(1) {
-                continue;
+            let min_allowed_start =
+                last_start.saturating_add(config.min_zoom_interval_ms.max(1));
+            if actual_start_ts < min_allowed_start {
+                actual_start_ts = min_allowed_start;
             }
         }
 
@@ -718,15 +733,15 @@ fn build_focus_transitions(
             .saturating_add(config.min_lock_duration_ms.max(1))
             .saturating_add(cluster_tail_bonus_ms);
         transitions.push(FocusTransition {
-            start_ts,
+            start_ts: actual_start_ts,
             trigger_ts: cluster.start_ts,
-            cluster_end_ts: cluster.end_ts.max(min_cluster_end),
+            cluster_end_ts: cluster.end_ts.max(min_cluster_end).max(actual_start_ts),
             center_x,
             center_y,
             zoom,
             focus_rect,
         });
-        last_transition_start = Some(start_ts);
+        last_transition_start = Some(actual_start_ts);
     }
 
     transitions.sort_by_key(|transition| transition.start_ts);
@@ -1086,10 +1101,12 @@ fn apply_locked_hard_edge_pan(
     let offset_y = cursor_ny - focus_center_y;
 
     if offset_x.abs() > hard_edge_x {
-        next_center_x += offset_x.signum() * max_step_x;
+        let allowed_step_x = (offset_x.abs() - hard_edge_x).max(0.0).min(max_step_x);
+        next_center_x += offset_x.signum() * allowed_step_x;
     }
     if offset_y.abs() > hard_edge_y {
-        next_center_y += offset_y.signum() * max_step_y;
+        let allowed_step_y = (offset_y.abs() - hard_edge_y).max(0.0).min(max_step_y);
+        next_center_y += offset_y.signum() * allowed_step_y;
     }
 
     clamp_center_to_viewport(next_center_x, next_center_y, view_w, view_h)
@@ -1248,12 +1265,14 @@ fn breaches_dead_zone(cursor_nx: f64, cursor_ny: f64, dead_zone_ratio: f64) -> b
         || cursor_ny > 0.5 + half
 }
 
-fn normalize_scroll_delta(delta: f64) -> f64 {
-    if delta.abs() >= 100.0 {
-        (delta / 120.0).clamp(-6.0, 6.0)
+fn locked_escape_margin_ratio(escape_distance_ratio: f64) -> f64 {
+    const BASE_MARGIN: f64 = 0.10;
+    let scale = if escape_distance_ratio.is_finite() {
+        escape_distance_ratio.max(0.0) / 0.80
     } else {
-        delta.clamp(-6.0, 6.0)
-    }
+        1.0
+    };
+    (BASE_MARGIN * scale).clamp(0.05, 0.25)
 }
 
 fn is_ctrl_key_code(key_code: &str) -> bool {

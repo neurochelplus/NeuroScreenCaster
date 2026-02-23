@@ -24,6 +24,7 @@ const CURSOR_SIZE_TO_FRAME_RATIO: f64 = 0.03;
 const CLICK_PULSE_MIN_SCALE: f64 = 0.82;
 const CLICK_PULSE_TOTAL_MS: f64 = 150.0;
 const CLICK_PULSE_DOWN_MS: f64 = 65.0;
+const CURSOR_TIMING_OFFSET_MS: u64 = 45;
 const MAX_CURSOR_SAMPLES_FOR_EXPR: usize = 90;
 const MAX_CLICK_EVENTS_FOR_EXPR: usize = 90;
 const MAX_CAMERA_STATES_FOR_ANALYTIC_EXPR: usize = 64;
@@ -1220,7 +1221,10 @@ fn build_cursor_overlay_plan(
         .iter()
         .filter_map(|event| match event {
             InputEvent::Click { ts, .. } => {
-                Some(map_time_ms(*ts, project_duration_ms, source_duration_ms))
+                Some(apply_cursor_timing_offset_ms(
+                    map_time_ms(*ts, project_duration_ms, source_duration_ms),
+                    source_duration_ms,
+                ))
             }
             _ => None,
         })
@@ -1245,7 +1249,10 @@ fn build_cursor_overlay_plan(
         .into_iter()
         .map(|point| {
             (
-                map_time_ms(point.ts, project_duration_ms, source_duration_ms),
+                apply_cursor_timing_offset_ms(
+                    map_time_ms(point.ts, project_duration_ms, source_duration_ms),
+                    source_duration_ms,
+                ),
                 (point.x / screen_w * src_w).clamp(0.0, src_w),
                 (point.y / screen_h * src_h).clamp(0.0, src_h),
             )
@@ -1384,7 +1391,10 @@ fn build_vector_cursor_ass_file(
         .into_iter()
         .map(|point| {
             (
-                map_time_ms(point.ts, project_duration_ms, source_duration_ms),
+                apply_cursor_timing_offset_ms(
+                    map_time_ms(point.ts, project_duration_ms, source_duration_ms),
+                    source_duration_ms,
+                ),
                 (point.x / screen_w * src_w).clamp(0.0, src_w),
                 (point.y / screen_h * src_h).clamp(0.0, src_h),
             )
@@ -1405,7 +1415,10 @@ fn build_vector_cursor_ass_file(
         .iter()
         .filter_map(|event| match event {
             InputEvent::Click { ts, .. } => {
-                Some(map_time_ms(*ts, project_duration_ms, source_duration_ms))
+                Some(apply_cursor_timing_offset_ms(
+                    map_time_ms(*ts, project_duration_ms, source_duration_ms),
+                    source_duration_ms,
+                ))
             }
             _ => None,
         })
@@ -1882,6 +1895,12 @@ fn map_time_ms(ts: u64, from_duration_ms: u64, to_duration_ms: u64) -> u64 {
     }
     let mapped = (ts as f64 / from_duration_ms as f64) * to_duration_ms as f64;
     mapped.round().clamp(0.0, to_duration_ms as f64) as u64
+}
+
+fn apply_cursor_timing_offset_ms(ts_ms: u64, duration_ms: u64) -> u64 {
+    ts_ms
+        .saturating_add(CURSOR_TIMING_OFFSET_MS)
+        .min(duration_ms)
 }
 
 fn format_ass_time(ms: u64) -> String {
