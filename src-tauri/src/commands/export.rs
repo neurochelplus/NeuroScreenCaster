@@ -26,13 +26,20 @@ const CLICK_PULSE_TOTAL_MS: f64 = 150.0;
 const CLICK_PULSE_DOWN_MS: f64 = 65.0;
 const CURSOR_TIMING_OFFSET_MS: u64 = 45;
 const MAX_CURSOR_SAMPLES_FOR_EXPR: usize = 90;
+const MAX_CURSOR_SAMPLES_FOR_EXPR_HARD_CAP: usize = 1_200;
 const MAX_CLICK_EVENTS_FOR_EXPR: usize = 90;
 const MAX_CAMERA_STATES_FOR_ANALYTIC_EXPR: usize = 64;
 const MAX_CAMERA_POINTS_FOR_EXPR: usize = 480;
+const MAX_CAMERA_POINTS_FOR_EXPR_HARD_CAP: usize = 2_400;
+const CAMERA_POINTS_BUDGET_GROWTH_PER_SEC: f64 = 0.6;
+const CURSOR_EXPR_BUDGET_GROWTH_PER_SEC: f64 = 0.8;
 const CAMERA_FALLBACK_SAMPLE_RATE_HZ: f64 = 20.0;
 const MIN_CLICK_PULSE_GAP_MS: u64 = 120;
 const ENABLE_CUSTOM_CURSOR_OVERLAY_EXPORT: bool = false;
 const VECTOR_CURSOR_SAMPLE_FPS: f64 = 18.0;
+const BASE_VECTOR_CURSOR_ASS_SAMPLES: usize = 480;
+const MAX_VECTOR_CURSOR_ASS_SAMPLES: usize = 3_600;
+const VECTOR_CURSOR_ASS_BUDGET_GROWTH_PER_SEC: f64 = 3.0;
 const VECTOR_CURSOR_ASS_BASE_HEIGHT: f64 = 112.0;
 const VECTOR_CURSOR_ASS_PATH: &str = "m 0 0 l 0 90 l 22 70 l 35 110 l 50 102 l 38 63 l 72 63 l 0 0";
 
@@ -958,8 +965,15 @@ fn build_camera_value_expr(
 
     if ordered.len() > MAX_CAMERA_STATES_FOR_ANALYTIC_EXPR {
         let sampled = sample_camera_value_points(&ordered, axis, default_value, safe_fps);
-        let reduced = decimate_time_value_points(&sampled, MAX_CAMERA_POINTS_FOR_EXPR);
-        let duration_ms = reduced.last().map(|(ts, _)| *ts).unwrap_or(0);
+        let duration_ms = sampled.last().map(|(ts, _)| *ts).unwrap_or(0);
+        let max_points = adaptive_sample_budget(
+            duration_ms,
+            MAX_CAMERA_POINTS_FOR_EXPR,
+            MAX_CAMERA_POINTS_FOR_EXPR_HARD_CAP,
+            CAMERA_POINTS_BUDGET_GROWTH_PER_SEC,
+            sampled.len(),
+        );
+        let reduced = decimate_time_value_points(&sampled, max_points);
         return build_piecewise_track_expr(&reduced, duration_ms);
     }
 
@@ -1210,8 +1224,16 @@ fn build_cursor_overlay_plan(
     }
 
     points.sort_by_key(|point| point.ts);
-    let desired_samples = (((source_duration_ms as f64) / 100.0).ceil() as usize)
-        .clamp(24, MAX_CURSOR_SAMPLES_FOR_EXPR)
+    let raw_desired_samples = (((source_duration_ms as f64) / 100.0).ceil() as usize).max(2);
+    let cursor_expr_budget = adaptive_sample_budget(
+        source_duration_ms,
+        MAX_CURSOR_SAMPLES_FOR_EXPR,
+        MAX_CURSOR_SAMPLES_FOR_EXPR_HARD_CAP,
+        CURSOR_EXPR_BUDGET_GROWTH_PER_SEC,
+        raw_desired_samples,
+    );
+    let desired_samples = raw_desired_samples
+        .clamp(24, cursor_expr_budget.max(24))
         .max(2);
     let frame_count = desired_samples - 1;
     let frame_step_ms = (source_duration_ms as f64 / frame_count as f64).max(1.0);
@@ -1220,12 +1242,10 @@ fn build_cursor_overlay_plan(
         .events
         .iter()
         .filter_map(|event| match event {
-            InputEvent::Click { ts, .. } => {
-                Some(apply_cursor_timing_offset_ms(
-                    map_time_ms(*ts, project_duration_ms, source_duration_ms),
-                    source_duration_ms,
-                ))
-            }
+            InputEvent::Click { ts, .. } => Some(apply_cursor_timing_offset_ms(
+                map_time_ms(*ts, project_duration_ms, source_duration_ms),
+                source_duration_ms,
+            )),
             _ => None,
         })
         .collect();
@@ -1302,7 +1322,7 @@ fn build_cursor_overlay_plan(
     sampled.dedup_by(|left, right| {
         left.0 == right.0 && (left.1 - right.1).abs() < 0.1 && (left.2 - right.2).abs() < 0.1
     });
-    let sampled = decimate_cursor_samples(&sampled, MAX_CURSOR_SAMPLES_FOR_EXPR);
+    let sampled = decimate_cursor_samples(&sampled, cursor_expr_budget.max(24));
 
     let x_points: Vec<(u64, f64)> = sampled.iter().map(|(ts, x, _)| (*ts, *x)).collect();
     let y_points: Vec<(u64, f64)> = sampled.iter().map(|(ts, _, y)| (*ts, *y)).collect();
@@ -1414,12 +1434,10 @@ fn build_vector_cursor_ass_file(
         .events
         .iter()
         .filter_map(|event| match event {
-            InputEvent::Click { ts, .. } => {
-                Some(apply_cursor_timing_offset_ms(
-                    map_time_ms(*ts, project_duration_ms, source_duration_ms),
-                    source_duration_ms,
-                ))
-            }
+            InputEvent::Click { ts, .. } => Some(apply_cursor_timing_offset_ms(
+                map_time_ms(*ts, project_duration_ms, source_duration_ms),
+                source_duration_ms,
+            )),
             _ => None,
         })
         .collect();
@@ -1470,7 +1488,14 @@ fn build_vector_cursor_ass_file(
             && left.2 == right.2
             && (left.3 - right.3).abs() < 0.01
     });
-    let sampled = decimate_cursor_samples_scaled(&sampled, 480);
+    let vector_ass_budget = adaptive_sample_budget(
+        source_duration_ms,
+        BASE_VECTOR_CURSOR_ASS_SAMPLES,
+        MAX_VECTOR_CURSOR_ASS_SAMPLES,
+        VECTOR_CURSOR_ASS_BUDGET_GROWTH_PER_SEC,
+        sampled.len(),
+    );
+    let sampled = decimate_cursor_samples_scaled(&sampled, vector_ass_budget);
 
     let target_min_side = target_width.min(target_height).max(1) as f64;
     let cursor_height_px =
@@ -1540,81 +1565,240 @@ fn build_vector_cursor_ass_file(
 }
 
 fn decimate_cursor_samples(points: &[(u64, f64, f64)], max_points: usize) -> Vec<(u64, f64, f64)> {
-    if points.len() <= max_points || max_points < 2 {
-        return points.to_vec();
-    }
+    let keep_indices = select_motion_aware_indices(points.len(), max_points, |index| {
+        let (prev_t, prev_x, prev_y) = points[index - 1];
+        let (curr_t, curr_x, curr_y) = points[index];
+        let (next_t, next_x, next_y) = points[index + 1];
 
-    let mut result = Vec::with_capacity(max_points);
-    let last_index = points.len() - 1;
-    let max_index = max_points - 1;
-    let mut prev_idx = usize::MAX;
+        let total_dt_ms = next_t.saturating_sub(prev_t).max(1) as f64;
+        let alpha = (curr_t.saturating_sub(prev_t) as f64 / total_dt_ms).clamp(0.0, 1.0);
+        let interp_x = prev_x + (next_x - prev_x) * alpha;
+        let interp_y = prev_y + (next_y - prev_y) * alpha;
+        let fit_error = (curr_x - interp_x).hypot(curr_y - interp_y);
 
-    for index in 0..max_points {
-        let sample_idx = index * last_index / max_index;
-        if sample_idx == prev_idx {
-            continue;
-        }
-        result.push(points[sample_idx]);
-        prev_idx = sample_idx;
-    }
+        let dt1 = (curr_t.saturating_sub(prev_t).max(1) as f64) / 1000.0;
+        let dt2 = (next_t.saturating_sub(curr_t).max(1) as f64) / 1000.0;
+        let vx1 = (curr_x - prev_x) / dt1;
+        let vy1 = (curr_y - prev_y) / dt1;
+        let vx2 = (next_x - curr_x) / dt2;
+        let vy2 = (next_y - curr_y) / dt2;
+        let speed1 = vx1.hypot(vy1);
+        let speed2 = vx2.hypot(vy2);
+        let accel = (speed2 - speed1).abs();
 
-    if result.last().map(|point| point.0) != points.last().map(|point| point.0) {
-        result.push(points[last_index]);
-    }
+        let cross = (curr_x - prev_x) * (next_y - curr_y) - (curr_y - prev_y) * (next_x - curr_x);
+        let norm = ((curr_x - prev_x).hypot(curr_y - prev_y)
+            * (next_x - curr_x).hypot(next_y - curr_y))
+        .max(1.0);
+        let turn_factor = (cross.abs() / norm).clamp(0.0, 1.0);
 
-    result
+        fit_error * 3.0 + accel * 0.08 + turn_factor * 16.0
+    });
+
+    keep_indices
+        .into_iter()
+        .map(|index| points[index])
+        .collect()
 }
 
 fn decimate_cursor_samples_scaled(
     points: &[(u64, i64, i64, f64)],
     max_points: usize,
 ) -> Vec<(u64, i64, i64, f64)> {
-    if points.len() <= max_points || max_points < 2 {
-        return points.to_vec();
-    }
+    let keep_indices = select_motion_aware_indices(points.len(), max_points, |index| {
+        let (prev_t, prev_x, prev_y, prev_scale) = points[index - 1];
+        let (curr_t, curr_x, curr_y, curr_scale) = points[index];
+        let (next_t, next_x, next_y, next_scale) = points[index + 1];
 
-    let mut result = Vec::with_capacity(max_points);
-    let last_index = points.len() - 1;
-    let max_index = max_points - 1;
-    let mut prev_idx = usize::MAX;
+        let prev_x = prev_x as f64;
+        let prev_y = prev_y as f64;
+        let curr_x = curr_x as f64;
+        let curr_y = curr_y as f64;
+        let next_x = next_x as f64;
+        let next_y = next_y as f64;
 
-    for index in 0..max_points {
-        let sample_idx = index * last_index / max_index;
-        if sample_idx == prev_idx {
-            continue;
-        }
-        result.push(points[sample_idx]);
-        prev_idx = sample_idx;
-    }
+        let total_dt_ms = next_t.saturating_sub(prev_t).max(1) as f64;
+        let alpha = (curr_t.saturating_sub(prev_t) as f64 / total_dt_ms).clamp(0.0, 1.0);
+        let interp_x = prev_x + (next_x - prev_x) * alpha;
+        let interp_y = prev_y + (next_y - prev_y) * alpha;
+        let interp_scale = prev_scale + (next_scale - prev_scale) * alpha;
 
-    if result.last().map(|point| point.0) != points.last().map(|point| point.0) {
-        result.push(points[last_index]);
-    }
+        let fit_error = (curr_x - interp_x).hypot(curr_y - interp_y);
+        let scale_error = (curr_scale - interp_scale).abs() * 36.0;
 
-    result
+        let dt1 = (curr_t.saturating_sub(prev_t).max(1) as f64) / 1000.0;
+        let dt2 = (next_t.saturating_sub(curr_t).max(1) as f64) / 1000.0;
+        let speed1 = (curr_x - prev_x).hypot(curr_y - prev_y) / dt1;
+        let speed2 = (next_x - curr_x).hypot(next_y - curr_y) / dt2;
+        let accel = (speed2 - speed1).abs();
+
+        let scale_rate_1 = (curr_scale - prev_scale).abs() / dt1;
+        let scale_rate_2 = (next_scale - curr_scale).abs() / dt2;
+        let scale_accel = (scale_rate_2 - scale_rate_1).abs();
+
+        fit_error * 3.0 + scale_error + accel * 0.08 + scale_accel * 18.0
+    });
+
+    keep_indices
+        .into_iter()
+        .map(|index| points[index])
+        .collect()
 }
 
 fn decimate_time_value_points(points: &[(u64, f64)], max_points: usize) -> Vec<(u64, f64)> {
-    if points.len() <= max_points || max_points < 2 {
-        return points.to_vec();
+    let keep_indices = select_motion_aware_indices(points.len(), max_points, |index| {
+        let (prev_t, prev_value) = points[index - 1];
+        let (curr_t, curr_value) = points[index];
+        let (next_t, next_value) = points[index + 1];
+
+        let total_dt_ms = next_t.saturating_sub(prev_t).max(1) as f64;
+        let alpha = (curr_t.saturating_sub(prev_t) as f64 / total_dt_ms).clamp(0.0, 1.0);
+        let interp = prev_value + (next_value - prev_value) * alpha;
+        let fit_error = (curr_value - interp).abs();
+
+        let dt1 = (curr_t.saturating_sub(prev_t).max(1) as f64) / 1000.0;
+        let dt2 = (next_t.saturating_sub(curr_t).max(1) as f64) / 1000.0;
+        let speed1 = (curr_value - prev_value).abs() / dt1;
+        let speed2 = (next_value - curr_value).abs() / dt2;
+        let accel = (speed2 - speed1).abs();
+
+        fit_error * 4.0 + accel * 0.2
+    });
+
+    keep_indices
+        .into_iter()
+        .map(|index| points[index])
+        .collect()
+}
+
+fn adaptive_sample_budget(
+    duration_ms: u64,
+    base_budget: usize,
+    hard_cap: usize,
+    growth_per_second: f64,
+    input_len: usize,
+) -> usize {
+    if input_len <= 2 {
+        return input_len;
     }
 
-    let mut result = Vec::with_capacity(max_points);
-    let last_index = points.len() - 1;
-    let max_index = max_points - 1;
-    let mut prev_idx = usize::MAX;
+    let cap = hard_cap.max(2);
+    let base = base_budget.clamp(2, cap);
+    let extra = ((duration_ms as f64 / 1000.0).max(0.0) * growth_per_second.max(0.0)).round();
+    let grown = (base as f64 + extra).round() as usize;
+    grown.clamp(base, cap).min(input_len)
+}
 
-    for index in 0..max_points {
-        let sample_idx = index * last_index / max_index;
-        if sample_idx == prev_idx {
+fn select_motion_aware_indices(
+    len: usize,
+    max_points: usize,
+    mut score_for_index: impl FnMut(usize) -> f64,
+) -> Vec<usize> {
+    if len <= max_points || max_points < 2 || len <= 2 {
+        return (0..len).collect();
+    }
+
+    let target_total = max_points.clamp(2, len);
+    let target_internal = target_total.saturating_sub(2).min(len.saturating_sub(2));
+    if target_internal == 0 {
+        return vec![0, len - 1];
+    }
+
+    let anchor_target = ((target_internal as f64) * 0.35).round() as usize;
+    let anchor_count = anchor_target.clamp(1, target_internal);
+
+    let mut keep_mask = vec![false; len];
+    keep_mask[0] = true;
+    keep_mask[len - 1] = true;
+
+    let mut kept_internal = 0usize;
+    for index in select_uniform_internal_indices(len, anchor_count) {
+        if !keep_mask[index] {
+            keep_mask[index] = true;
+            kept_internal += 1;
+        }
+    }
+
+    let mut scored: Vec<(usize, f64)> = (1..(len - 1))
+        .map(|index| {
+            let score = score_for_index(index);
+            (
+                index,
+                if score.is_finite() {
+                    score.max(0.0)
+                } else {
+                    0.0
+                },
+            )
+        })
+        .collect();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    for (index, _) in scored {
+        if kept_internal >= target_internal {
+            break;
+        }
+        if keep_mask[index] {
             continue;
         }
-        result.push(points[sample_idx]);
-        prev_idx = sample_idx;
+        keep_mask[index] = true;
+        kept_internal += 1;
     }
 
-    if result.last().map(|point| point.0) != points.last().map(|point| point.0) {
-        result.push(points[last_index]);
+    if kept_internal < target_internal {
+        for index in select_uniform_internal_indices(len, target_internal) {
+            if kept_internal >= target_internal {
+                break;
+            }
+            if keep_mask[index] {
+                continue;
+            }
+            keep_mask[index] = true;
+            kept_internal += 1;
+        }
+    }
+
+    let mut indices: Vec<usize> = keep_mask
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, keep)| keep.then_some(index))
+        .collect();
+    indices.sort_unstable();
+    indices
+}
+
+fn select_uniform_internal_indices(len: usize, count: usize) -> Vec<usize> {
+    if len <= 2 || count == 0 {
+        return Vec::new();
+    }
+
+    let interior = len - 2;
+    let target = count.min(interior);
+    let mut result: Vec<usize> = Vec::with_capacity(target);
+
+    for slot in 0..target {
+        let idx = 1 + ((slot + 1) * interior) / (target + 1);
+        let idx = idx.clamp(1, len - 2);
+        if result.last().copied() != Some(idx) {
+            result.push(idx);
+        }
+    }
+
+    if result.len() < target {
+        for idx in 1..(len - 1) {
+            if result.len() >= target {
+                break;
+            }
+            if result.contains(&idx) {
+                continue;
+            }
+            result.push(idx);
+        }
     }
 
     result

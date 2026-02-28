@@ -712,8 +712,7 @@ fn build_focus_transitions(
         let start_ts = choose_preroll_start(cluster.start_ts, velocities, config);
         let mut actual_start_ts = start_ts;
         if let Some(last_start) = last_transition_start {
-            let min_allowed_start =
-                last_start.saturating_add(config.min_zoom_interval_ms.max(1));
+            let min_allowed_start = last_start.saturating_add(config.min_zoom_interval_ms.max(1));
             if actual_start_ts < min_allowed_start {
                 actual_start_ts = min_allowed_start;
             }
