@@ -172,6 +172,18 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
+function isExpectedPlaybackAbort(err: unknown): boolean {
+  if (err instanceof DOMException && err.name === "AbortError") {
+    return true;
+  }
+  const text = String(err);
+  return (
+    text.includes("AbortError") ||
+    text.includes("interrupted by a call to pause()") ||
+    text.includes("The play() request was interrupted")
+  );
+}
+
 function normalizeRect(rect: NormalizedRect): NormalizedRect {
   const width = clamp(rect.width, MIN_RECT_SIZE, 1);
   const height = clamp(rect.height, MIN_RECT_SIZE, 1);
@@ -1130,6 +1142,7 @@ export default function EditScreen() {
   const playheadStateRef = useRef(0);
   const lastStateSyncAtRef = useRef(0);
   const playbackClockRef = useRef<{ anchorPerfMs: number; anchorPreviewMs: number } | null>(null);
+  const playRequestSeqRef = useRef(0);
 
   const timelineDurationMs = project?.durationMs ?? 0;
   const previewDurationMs = useMemo(() => {
@@ -1620,6 +1633,13 @@ export default function EditScreen() {
   }, [isVideoPlaying, playheadMs, previewDurationMs]);
 
   useEffect(() => {
+    // Invalidate in-flight play() promises when source/project changes.
+    playRequestSeqRef.current += 1;
+    playbackClockRef.current = null;
+    setIsVideoPlaying(false);
+  }, [videoSrc]);
+
+  useEffect(() => {
     if (previewDurationMs <= 0) {
       return;
     }
@@ -1976,21 +1996,31 @@ export default function EditScreen() {
     const clampedVolume = clamp(previewVolume, 0, 1);
     video.volume = clampedVolume;
     video.muted = clampedVolume <= 0.001;
+    setVideoError(null);
 
     if (video.paused || video.ended) {
+      const requestSeq = playRequestSeqRef.current + 1;
+      playRequestSeqRef.current = requestSeq;
       try {
         await video.play();
+        if (requestSeq !== playRequestSeqRef.current) {
+          return;
+        }
         playbackClockRef.current = {
           anchorPerfMs: performance.now(),
           anchorPreviewMs: clamp(playheadRef.current, 0, previewDurationMs),
         };
         setIsVideoPlaying(true);
       } catch (err) {
+        if (requestSeq !== playRequestSeqRef.current || isExpectedPlaybackAbort(err)) {
+          return;
+        }
         setVideoError(`Failed to play video: ${String(err)}`);
       }
       return;
     }
 
+    playRequestSeqRef.current += 1;
     video.pause();
     playbackClockRef.current = null;
     setIsVideoPlaying(false);
