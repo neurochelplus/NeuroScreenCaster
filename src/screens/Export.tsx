@@ -83,13 +83,31 @@ export default function ExportScreen() {
   const [isRefreshingProjects, setIsRefreshingProjects] = useState(false);
   const [isLoadingProject, setIsLoadingProject] = useState(false);
   const [isStartingExport, setIsStartingExport] = useState(false);
+  const [isCancellingExport, setIsCancellingExport] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
 
-  const progressPercent = useMemo(
-    () => Math.round(Math.min(Math.max(status.progress, 0), 1) * 100),
+  const progressPercentPrecise = useMemo(
+    () => Math.min(Math.max(status.progress, 0), 1) * 100,
     [status.progress]
   );
+  const elapsedMs = useMemo(() => {
+    if (!status.startedAtMs) {
+      return null;
+    }
+    return Math.max(0, nowMs - status.startedAtMs);
+  }, [nowMs, status.startedAtMs]);
+  const etaMs = useMemo(() => {
+    if (!status.isRunning || !elapsedMs) {
+      return null;
+    }
+    const progress = Math.min(Math.max(status.progress, 0), 1);
+    if (progress < 0.01 || progress >= 1) {
+      return null;
+    }
+    return Math.round((elapsedMs * (1 - progress)) / progress);
+  }, [elapsedMs, status.isRunning, status.progress]);
 
   const refreshProjects = async (autoSelect = false) => {
     setIsRefreshingProjects(true);
@@ -198,6 +216,14 @@ export default function ExportScreen() {
     };
   }, [status.isRunning]);
 
+  useEffect(() => {
+    if (!status.isRunning) {
+      return;
+    }
+    const timer = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [status.isRunning]);
+
   const handleStartExport = async () => {
     if (!selectedProjectPath) {
       setError("Select project for export.");
@@ -264,6 +290,21 @@ export default function ExportScreen() {
       await fetchStatus();
     } catch (err) {
       setError(String(err));
+    }
+  };
+
+  const handleCancelExport = async () => {
+    setError(null);
+    setInfo(null);
+    setIsCancellingExport(true);
+    try {
+      await invoke("cancel_export");
+      setInfo("Cancel requested.");
+      await fetchStatus();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setIsCancellingExport(false);
     }
   };
 
@@ -392,11 +433,24 @@ export default function ExportScreen() {
               <button
                 className="btn-primary"
                 onClick={() => void handleStartExport()}
-                disabled={!selectedProjectPath || isStartingExport || status.isRunning}
+                disabled={
+                  !selectedProjectPath || isStartingExport || isCancellingExport || status.isRunning
+                }
               >
                 {status.isRunning ? "Exporting..." : isStartingExport ? "Starting..." : "Start Export"}
               </button>
-              <button className="btn-ghost" onClick={() => void handleResetStatus()} disabled={status.isRunning}>
+              <button
+                className="btn-ghost"
+                onClick={() => void handleCancelExport()}
+                disabled={!status.isRunning || isCancellingExport}
+              >
+                {isCancellingExport ? "Cancelling..." : "Cancel Export"}
+              </button>
+              <button
+                className="btn-ghost"
+                onClick={() => void handleResetStatus()}
+                disabled={status.isRunning || isCancellingExport}
+              >
                 Reset Status
               </button>
             </div>
@@ -407,15 +461,25 @@ export default function ExportScreen() {
           <h2>Status</h2>
           <div className="export-status-row">
             <span className="export-status-label">{status.message || "Idle"}</span>
-            <span className="export-status-value">{progressPercent}%</span>
+            <span className="export-status-value">{progressPercentPrecise.toFixed(1)}%</span>
           </div>
           <div className="export-progress">
-            <div className="export-progress-fill" style={{ width: `${progressPercent}%` }} />
+            <div
+              className="export-progress-fill"
+              style={{
+                width: `${Math.max(
+                  progressPercentPrecise,
+                  status.isRunning && progressPercentPrecise > 0 ? 0.3 : 0
+                )}%`,
+              }}
+            />
           </div>
           <div className="export-meta">
             <span>Project: {selectedProjectName || "n/a"}</span>
             <span>Started: {formatDate(status.startedAtMs)}</span>
             <span>Finished: {formatDate(status.finishedAtMs)}</span>
+            <span>Elapsed: {elapsedMs == null ? "n/a" : formatMs(elapsedMs)}</span>
+            <span>ETA: {etaMs == null ? "n/a" : formatMs(etaMs)}</span>
             <span>Output: {status.outputPath ?? "n/a"}</span>
           </div>
         </aside>

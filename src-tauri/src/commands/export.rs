@@ -1,15 +1,17 @@
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::UNIX_EPOCH;
 
 use rfd::FileDialog;
 use serde::Serialize;
 
-use crate::algorithm::cursor_smoothing::smooth_cursor_path;
 use crate::capture::recorder::{apply_no_window_flags, find_ffmpeg_exe};
 use crate::commands::cursor::resolve_cursor_asset_for_render;
 use crate::models::events::{EventsFile, InputEvent, SCHEMA_VERSION as EVENTS_SCHEMA_VERSION};
@@ -30,18 +32,21 @@ const MAX_CURSOR_SAMPLES_FOR_EXPR_HARD_CAP: usize = 1_200;
 const MAX_CLICK_EVENTS_FOR_EXPR: usize = 90;
 const MAX_CAMERA_STATES_FOR_ANALYTIC_EXPR: usize = 64;
 const MAX_CAMERA_POINTS_FOR_EXPR: usize = 480;
-const MAX_CAMERA_POINTS_FOR_EXPR_HARD_CAP: usize = 2_400;
-const CAMERA_POINTS_BUDGET_GROWTH_PER_SEC: f64 = 0.6;
+const MAX_CAMERA_POINTS_FOR_EXPR_HARD_CAP: usize = 12_000;
+const CAMERA_POINTS_BUDGET_GROWTH_PER_SEC: f64 = 5.0;
 const CURSOR_EXPR_BUDGET_GROWTH_PER_SEC: f64 = 0.8;
-const CAMERA_FALLBACK_SAMPLE_RATE_HZ: f64 = 20.0;
+const CAMERA_FALLBACK_SAMPLE_RATE_HZ: f64 = 60.0;
 const MIN_CLICK_PULSE_GAP_MS: u64 = 120;
 const ENABLE_CUSTOM_CURSOR_OVERLAY_EXPORT: bool = false;
-const VECTOR_CURSOR_SAMPLE_FPS: f64 = 18.0;
-const BASE_VECTOR_CURSOR_ASS_SAMPLES: usize = 480;
-const MAX_VECTOR_CURSOR_ASS_SAMPLES: usize = 3_600;
-const VECTOR_CURSOR_ASS_BUDGET_GROWTH_PER_SEC: f64 = 3.0;
+const VECTOR_CURSOR_MIN_SAMPLE_FPS: f64 = 24.0;
+const VECTOR_CURSOR_MAX_SAMPLE_FPS: f64 = 60.0;
+const BASE_VECTOR_CURSOR_ASS_SAMPLES: usize = 1_200;
+const MAX_VECTOR_CURSOR_ASS_SAMPLES: usize = 36_000;
+const VECTOR_CURSOR_ASS_BUDGET_GROWTH_PER_SEC: f64 = 18.0;
 const VECTOR_CURSOR_ASS_BASE_HEIGHT: f64 = 112.0;
 const VECTOR_CURSOR_ASS_PATH: &str = "m 0 0 l 0 90 l 22 70 l 35 110 l 50 102 l 38 63 l 72 63 l 0 0";
+const EXPORT_CANCELLED_SENTINEL: &str = "__NSC_EXPORT_CANCELLED__";
+static EXPORT_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy)]
 struct SpringParams {
@@ -145,7 +150,23 @@ pub async fn reset_export_status(state: tauri::State<'_, ExportState>) -> Result
     if status.is_running {
         return Err("Cannot reset status while export is running".to_string());
     }
+    EXPORT_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
     *status = ExportStatus::default();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_export(state: tauri::State<'_, ExportState>) -> Result<(), String> {
+    let mut status = state
+        .0
+        .lock()
+        .map_err(|_| "Failed to access export status".to_string())?;
+    if !status.is_running {
+        return Err("No active export to cancel".to_string());
+    }
+
+    EXPORT_CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+    status.message = "Cancelling export...".to_string();
     Ok(())
 }
 
@@ -180,6 +201,8 @@ pub async fn start_export(
     codec: Option<String>,
     output_path: Option<String>,
 ) -> Result<(), String> {
+    EXPORT_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+
     let project_file = resolve_project_file(&project_path)?;
     let project = load_project_file(&project_file)?;
     let project_dir = project_file.parent().ok_or_else(|| {
@@ -330,6 +353,7 @@ fn run_export_job(
         &output_video,
         &filter_graph,
         &codec,
+        fps,
         source_duration_ms,
     );
 
@@ -348,11 +372,18 @@ fn run_export_job(
                 status.error = None;
             }
             Err(err) => {
-                status.message = "Export failed".to_string();
-                status.error = Some(err);
+                if err == EXPORT_CANCELLED_SENTINEL {
+                    status.message = "Export cancelled".to_string();
+                    status.error = None;
+                } else {
+                    status.message = "Export failed".to_string();
+                    status.error = Some(err);
+                }
             }
         }
     });
+
+    EXPORT_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
 }
 
 fn execute_ffmpeg_export(
@@ -362,6 +393,7 @@ fn execute_ffmpeg_export(
     output_video: &Path,
     filter_graph: &str,
     codec: &str,
+    target_fps: u32,
     source_duration_ms: u64,
 ) -> Result<(), String> {
     let filter_script_path = std::env::temp_dir().join(format!("nsc-filter-{}.txt", now_ms()));
@@ -371,12 +403,22 @@ fn execute_ffmpeg_export(
             filter_script_path.display()
         )
     })?;
+    let progress_file_path = std::env::temp_dir().join(format!("nsc-progress-{}.txt", now_ms()));
+    let _ = std::fs::write(&progress_file_path, "");
 
     let ffmpeg = find_ffmpeg_exe();
 
     let mut command = Command::new(&ffmpeg);
     apply_no_window_flags(&mut command);
-    command.arg("-y").arg("-i").arg(source_video);
+    command
+        .arg("-y")
+        .arg("-hide_banner")
+        .arg("-stats_period")
+        .arg("0.5")
+        .arg("-progress")
+        .arg(&progress_file_path)
+        .arg("-i")
+        .arg(source_video);
 
     if let Some(cursor_image_path) = cursor_image {
         command
@@ -430,6 +472,7 @@ fn execute_ffmpeg_export(
         }
         _ => {
             let _ = std::fs::remove_file(&filter_script_path);
+            let _ = std::fs::remove_file(&progress_file_path);
             return Err(format!("Unsupported codec: {codec}"));
         }
     };
@@ -444,40 +487,203 @@ fn execute_ffmpeg_export(
         .spawn()
         .map_err(|e| {
             let _ = std::fs::remove_file(&filter_script_path);
+            let _ = std::fs::remove_file(&progress_file_path);
             format!(
                 "Failed to start FFmpeg export ({}): {e}",
                 ffmpeg.to_string_lossy()
             )
         })?;
 
-    let mut stderr_tail: VecDeque<String> = VecDeque::new();
-    if let Some(stderr) = child.stderr.take() {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            let line = match line {
-                Ok(line) => line,
-                Err(_) => continue,
-            };
+    let stderr = child.stderr.take();
 
-            stderr_tail.push_back(line.clone());
-            if stderr_tail.len() > 50 {
-                stderr_tail.pop_front();
-            }
+    let progress_status = Arc::clone(status_state);
+    let expected_total_frames = ((source_duration_ms as f64 / 1000.0) * (target_fps as f64))
+        .max(1.0)
+        .round();
+    let progress_done = Arc::new(AtomicBool::new(false));
+    let progress_done_worker = Arc::clone(&progress_done);
+    let progress_path_worker = progress_file_path.clone();
+    let progress_handle = std::thread::spawn(move || {
+        let started_at = std::time::Instant::now();
+        let mut last_reported_progress = 0.0f64;
 
-            if let Some(time_ms) = extract_ffmpeg_time_ms(&line) {
-                let progress = (time_ms as f64 / source_duration_ms as f64).clamp(0.0, 0.99);
-                update_status(status_state, |status| {
-                    status.progress = progress;
-                    status.message = format!("Exporting... {}%", (progress * 100.0).round() as u32);
+        loop {
+            if let Ok(snapshot) = std::fs::read_to_string(&progress_path_worker) {
+                let (time_ms, frame, progress_end) = parse_ffmpeg_progress_snapshot(&snapshot);
+                if let Some(time_ms) = time_ms {
+                    let progress = (time_ms as f64 / source_duration_ms as f64).clamp(0.0, 0.99);
+                    if progress > last_reported_progress {
+                        last_reported_progress = progress;
+                        update_status(&progress_status, |status| {
+                            status.progress = progress;
+                            status.message =
+                                format!("Exporting... {}%", (progress * 100.0).round() as u32);
+                        });
+                    }
+                } else if let Some(frame) = frame {
+                    let progress = (frame as f64 / expected_total_frames).clamp(0.0, 0.99);
+                    if progress > last_reported_progress {
+                        last_reported_progress = progress;
+                        update_status(&progress_status, |status| {
+                            status.progress = progress;
+                            status.message =
+                                format!("Exporting... {}%", (progress * 100.0).round() as u32);
+                        });
+                    }
+                } else {
+                    update_status(&progress_status, |status| {
+                        if status.progress <= 0.0 {
+                            let elapsed = started_at.elapsed().as_secs();
+                            status.message =
+                                format!("Exporting... preparing frames ({}s)", elapsed);
+                        }
+                    });
+                }
+
+                if progress_end && progress_done_worker.load(Ordering::Relaxed) {
+                    break;
+                }
+            } else {
+                update_status(&progress_status, |status| {
+                    if status.progress <= 0.0 {
+                        let elapsed = started_at.elapsed().as_secs();
+                        status.message = format!("Exporting... preparing frames ({}s)", elapsed);
+                    }
                 });
             }
-        }
-    }
 
-    let exit_status = child.wait().map_err(|e| {
+            // Last-resort fallback so UI progress is never stuck at 0 on platforms where
+            // ffmpeg runtime stats are delayed or suppressed.
+            let estimated = (started_at.elapsed().as_millis() as f64 / source_duration_ms as f64)
+                .clamp(0.0, 0.95);
+            if estimated > last_reported_progress {
+                last_reported_progress = estimated;
+                update_status(&progress_status, |status| {
+                    if estimated > status.progress {
+                        status.progress = estimated;
+                        status.message =
+                            format!("Exporting... {}% (estimated)", (estimated * 100.0).round() as u32);
+                    }
+                });
+            }
+
+            if progress_done_worker.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+
+        if let Ok(snapshot) = std::fs::read_to_string(&progress_path_worker) {
+            let (time_ms, frame, _) = parse_ffmpeg_progress_snapshot(&snapshot);
+            let progress = if let Some(time_ms) = time_ms {
+                Some((time_ms as f64 / source_duration_ms as f64).clamp(0.0, 0.99))
+            } else {
+                frame.map(|frame| (frame as f64 / expected_total_frames).clamp(0.0, 0.99))
+            };
+            if let Some(progress) = progress {
+                if progress > last_reported_progress {
+                    update_status(&progress_status, |status| {
+                        status.progress = progress;
+                        status.message =
+                            format!("Exporting... {}%", (progress * 100.0).round() as u32);
+                    });
+                }
+            }
+        }
+    });
+
+    let stderr_status = Arc::clone(status_state);
+    let stderr_handle = std::thread::spawn(move || -> VecDeque<String> {
+        let mut stderr_tail: VecDeque<String> = VecDeque::new();
+        if let Some(stderr) = stderr {
+            let mut reader = BufReader::new(stderr);
+            let mut chunk = [0u8; 4096];
+            let mut buffer = String::new();
+
+            let process_line = |line: &str, tail: &mut VecDeque<String>| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+
+                if let Some(time_ms) = extract_ffmpeg_time_ms(trimmed) {
+                    let progress = (time_ms as f64 / source_duration_ms as f64).clamp(0.0, 0.99);
+                    update_status(&stderr_status, |status| {
+                        if progress > status.progress {
+                            status.progress = progress;
+                            status.message =
+                                format!("Exporting... {}%", (progress * 100.0).round() as u32);
+                        }
+                    });
+                } else if let Some(frame) = extract_ffmpeg_status_frame(trimmed) {
+                    let progress = (frame as f64 / expected_total_frames).clamp(0.0, 0.99);
+                    update_status(&stderr_status, |status| {
+                        if progress > status.progress {
+                            status.progress = progress;
+                            status.message =
+                                format!("Exporting... {}%", (progress * 100.0).round() as u32);
+                        }
+                    });
+                }
+
+                tail.push_back(trimmed.to_string());
+                if tail.len() > 120 {
+                    tail.pop_front();
+                }
+            };
+
+            loop {
+                let read = match std::io::Read::read(&mut reader, &mut chunk) {
+                    Ok(read) => read,
+                    Err(_) => break,
+                };
+                if read == 0 {
+                    break;
+                }
+
+                buffer.push_str(&String::from_utf8_lossy(&chunk[..read]));
+                while let Some(idx) = buffer.find(|ch| ch == '\n' || ch == '\r') {
+                    let line = buffer[..idx].to_string();
+                    process_line(&line, &mut stderr_tail);
+                    buffer = buffer[idx + 1..].to_string();
+                }
+            }
+
+            if !buffer.trim().is_empty() {
+                process_line(&buffer, &mut stderr_tail);
+            }
+        }
+        stderr_tail
+    });
+
+    let mut cancelled = false;
+    let exit_status = loop {
+        if EXPORT_CANCEL_REQUESTED.load(Ordering::Relaxed) {
+            cancelled = true;
+            let _ = child.kill();
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&filter_script_path);
+                let _ = std::fs::remove_file(&progress_file_path);
+                return Err(format!("Failed to wait for FFmpeg export: {e}"));
+            }
+        }
+    };
+    progress_done.store(true, Ordering::Relaxed);
+    let _ = progress_handle.join();
+    let stderr_tail = stderr_handle.join().unwrap_or_default();
+
+    if cancelled {
         let _ = std::fs::remove_file(&filter_script_path);
-        format!("Failed to wait for FFmpeg export: {e}")
-    })?;
+        let _ = std::fs::remove_file(&progress_file_path);
+        return Err(EXPORT_CANCELLED_SENTINEL.to_string());
+    }
 
     if !exit_status.success() {
         let stderr_excerpt = stderr_tail
@@ -492,6 +698,7 @@ fn execute_ffmpeg_export(
             .cloned()
             .collect::<Vec<_>>();
         let _ = std::fs::remove_file(&filter_script_path);
+        let _ = std::fs::remove_file(&progress_file_path);
         if stderr_excerpt.is_empty() {
             return Err(format!("FFmpeg export failed with status: {exit_status}"));
         }
@@ -502,6 +709,7 @@ fn execute_ffmpeg_export(
     }
 
     let _ = std::fs::remove_file(&filter_script_path);
+    let _ = std::fs::remove_file(&progress_file_path);
     Ok(())
 }
 
@@ -1215,8 +1423,10 @@ fn build_cursor_overlay_plan(
         return Ok(None);
     };
 
-    let mut points = smooth_cursor_path(
+    let mut points = extract_preview_cursor_points(
         &events_file.events,
+        events_file.screen_width.max(1) as f64,
+        events_file.screen_height.max(1) as f64,
         project.settings.cursor.smoothing_factor,
     );
     if points.is_empty() {
@@ -1259,8 +1469,6 @@ fn build_cursor_overlay_plan(
         (project.settings.cursor.size * target_min_side * CURSOR_SIZE_TO_FRAME_RATIO)
             .clamp(8.0, 280.0);
 
-    let screen_w = events_file.screen_width.max(1) as f64;
-    let screen_h = events_file.screen_height.max(1) as f64;
     let src_w = source_width as f64;
     let src_h = source_height as f64;
     let dst_w = target_width as f64;
@@ -1273,8 +1481,8 @@ fn build_cursor_overlay_plan(
                     map_time_ms(point.ts, project_duration_ms, source_duration_ms),
                     source_duration_ms,
                 ),
-                (point.x / screen_w * src_w).clamp(0.0, src_w),
-                (point.y / screen_h * src_h).clamp(0.0, src_h),
+                (point.x * src_w).clamp(0.0, src_w),
+                (point.y * src_h).clamp(0.0, src_h),
             )
         })
         .collect();
@@ -1386,8 +1594,10 @@ fn build_vector_cursor_ass_file(
     target_height: u32,
     render_fps: f64,
 ) -> Result<PathBuf, String> {
-    let mut points = smooth_cursor_path(
+    let mut points = extract_preview_cursor_points(
         &events_file.events,
+        events_file.screen_width.max(1) as f64,
+        events_file.screen_height.max(1) as f64,
         project.settings.cursor.smoothing_factor,
     );
     if points.is_empty() {
@@ -1396,12 +1606,10 @@ fn build_vector_cursor_ass_file(
 
     points.sort_by_key(|point| point.ts);
 
-    let sample_fps = VECTOR_CURSOR_SAMPLE_FPS.clamp(8.0, 30.0);
+    let sample_fps = render_fps.clamp(VECTOR_CURSOR_MIN_SAMPLE_FPS, VECTOR_CURSOR_MAX_SAMPLE_FPS);
     let frame_step_ms = (1000.0 / sample_fps).max(1.0);
     let frame_count = ((source_duration_ms as f64 / frame_step_ms).ceil() as usize).max(2);
 
-    let screen_w = events_file.screen_width.max(1) as f64;
-    let screen_h = events_file.screen_height.max(1) as f64;
     let src_w = source_width.max(1) as f64;
     let src_h = source_height.max(1) as f64;
     let dst_w = target_width.max(1) as f64;
@@ -1415,8 +1623,8 @@ fn build_vector_cursor_ass_file(
                     map_time_ms(point.ts, project_duration_ms, source_duration_ms),
                     source_duration_ms,
                 ),
-                (point.x / screen_w * src_w).clamp(0.0, src_w),
-                (point.y / screen_h * src_h).clamp(0.0, src_h),
+                (point.x * src_w).clamp(0.0, src_w),
+                (point.y * src_h).clamp(0.0, src_h),
             )
         })
         .collect();
@@ -2105,6 +2313,74 @@ fn escape_filter_path(path: &Path) -> String {
         .replace('\'', "\\'")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreviewCursorPoint {
+    ts: u64,
+    x: f64,
+    y: f64,
+}
+
+// Keep export cursor math aligned with Edit.tsx preview:
+// - same event set (move/click/mouseUp/scroll)
+// - same EMA smoothing formula based on smoothing_factor.
+fn extract_preview_cursor_points(
+    events: &[InputEvent],
+    screen_width: f64,
+    screen_height: f64,
+    smoothing_factor: f64,
+) -> Vec<PreviewCursorPoint> {
+    if events.is_empty() || screen_width <= 0.0 || screen_height <= 0.0 {
+        return Vec::new();
+    }
+
+    let mut samples: Vec<PreviewCursorPoint> = events
+        .iter()
+        .filter_map(|event| match event {
+            InputEvent::Move { ts, x, y }
+            | InputEvent::Click { ts, x, y, .. }
+            | InputEvent::MouseUp { ts, x, y, .. }
+            | InputEvent::Scroll { ts, x, y, .. } => Some(PreviewCursorPoint {
+                ts: *ts,
+                x: (*x / screen_width).clamp(0.0, 1.0),
+                y: (*y / screen_height).clamp(0.0, 1.0),
+            }),
+            _ => None,
+        })
+        .collect();
+
+    if samples.is_empty() {
+        return samples;
+    }
+    samples.sort_by_key(|sample| sample.ts);
+
+    if samples.len() <= 1 {
+        return samples;
+    }
+
+    let factor = smoothing_factor.clamp(0.0, 1.0);
+    if factor <= f64::EPSILON {
+        return samples;
+    }
+
+    let alpha = 1.0 - factor * 0.9;
+    let mut smoothed_x = samples[0].x;
+    let mut smoothed_y = samples[0].y;
+    let mut smoothed = Vec::with_capacity(samples.len());
+    smoothed.push(samples[0]);
+
+    for sample in samples.iter().skip(1).copied() {
+        smoothed_x += alpha * (sample.x - smoothed_x);
+        smoothed_y += alpha * (sample.y - smoothed_y);
+        smoothed.push(PreviewCursorPoint {
+            ts: sample.ts,
+            x: smoothed_x,
+            y: smoothed_y,
+        });
+    }
+
+    smoothed
+}
+
 fn interpolate_cursor_position(points: &[(u64, f64, f64)], ts: u64) -> (f64, f64) {
     if points.is_empty() {
         return (0.0, 0.0);
@@ -2254,6 +2530,75 @@ fn extract_ffmpeg_duration_ms(line: &str) -> Option<u64> {
     let start = line.find(marker)? + marker.len();
     let value = line[start..].split(',').next()?.trim();
     parse_hhmmss_ms(value)
+}
+
+fn extract_ffmpeg_progress_time_ms(line: &str) -> Option<u64> {
+    if let Some(raw) = line.strip_prefix("out_time=") {
+        return parse_hhmmss_ms(raw.trim());
+    }
+
+    if let Some(raw) = line.strip_prefix("out_time_us=") {
+        let micros = raw.trim().parse::<u64>().ok()?;
+        return Some(micros / 1_000);
+    }
+
+    if let Some(raw) = line.strip_prefix("out_time_ms=") {
+        let value = raw.trim().parse::<u64>().ok()?;
+        // ffmpeg progress often reports out_time_ms in microseconds.
+        return Some(value / 1_000);
+    }
+
+    extract_ffmpeg_time_ms(line)
+}
+
+fn extract_ffmpeg_progress_frame(line: &str) -> Option<u64> {
+    let raw = line.strip_prefix("frame=")?;
+    raw.trim().parse::<u64>().ok()
+}
+
+fn extract_ffmpeg_status_frame(line: &str) -> Option<u64> {
+    let marker = "frame=";
+    let start = line.find(marker)? + marker.len();
+    let mut chars = line[start..].chars().peekable();
+    while matches!(chars.peek(), Some(ch) if ch.is_whitespace()) {
+        chars.next();
+    }
+
+    let mut digits = String::new();
+    while matches!(chars.peek(), Some(ch) if ch.is_ascii_digit()) {
+        digits.push(chars.next()?);
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+fn parse_ffmpeg_progress_snapshot(snapshot: &str) -> (Option<u64>, Option<u64>, bool) {
+    let mut last_time_ms = None;
+    let mut last_frame = None;
+    let mut ended = false;
+
+    for raw in snapshot.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(time_ms) = extract_ffmpeg_progress_time_ms(line) {
+            last_time_ms = Some(time_ms);
+            continue;
+        }
+        if let Some(frame) = extract_ffmpeg_progress_frame(line) {
+            last_frame = Some(frame);
+            continue;
+        }
+        if line == "progress=end" {
+            ended = true;
+        }
+    }
+
+    (last_time_ms, last_frame, ended)
 }
 
 fn extract_ffmpeg_time_ms(line: &str) -> Option<u64> {

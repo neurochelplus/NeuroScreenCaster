@@ -5,6 +5,9 @@
 ## [0.1.4] - 2026-02-23
 
 ### Fixed
+- Added reliable export progress fallback so progress no longer stays at 0% until completion on some FFmpeg environments.
+- Added export cancellation support (`cancel_export`) with graceful ffmpeg termination and final status `Export cancelled`.
+- Added ETA/Elapsed indicators in Export UI and fine-grained progress display (`x.y%`).
 - Исправлена деградация экспорта на длинных видео: зумы и курсор больше не становятся дерганными из-за переупрощения траекторий.
 - Для экспорта внедрено адаптивное motion-aware прореживание точек камеры и курсора (детализация растет с длительностью проекта, повороты и ускорения сохраняются лучше).
 - Исправлена ошибка предпросмотра в редакторе `Failed to play video: AbortError`.

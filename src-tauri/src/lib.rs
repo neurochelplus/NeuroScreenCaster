@@ -33,6 +33,7 @@ pub fn run() {
             commands::capture::resume_recording,
             commands::cursor::get_cursor_asset_info,
             commands::export::start_export,
+            commands::export::cancel_export,
             commands::export::pick_export_folder,
             commands::export::get_export_status,
             commands::export::reset_export_status,
