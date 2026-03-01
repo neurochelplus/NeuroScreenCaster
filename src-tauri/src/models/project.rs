@@ -131,6 +131,15 @@ pub struct CursorSettings {
     pub color: String,
     /// 0.0 = нет сглаживания, 1.0 = максимальное.
     pub smoothing_factor: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_ranges: Vec<TimeRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeRange {
+    pub start_ts: u64,
+    pub end_ts: u64,
 }
 
 impl Default for CursorSettings {
@@ -139,6 +148,7 @@ impl Default for CursorSettings {
             size: 1.0,
             color: "#FFFFFF".to_string(),
             smoothing_factor: 0.8,
+            hidden_ranges: Vec::new(),
         }
     }
 }
@@ -180,7 +190,7 @@ impl Default for ExportSettings {
         ExportSettings {
             width: 1920,
             height: 1080,
-            fps: 30,
+            fps: 60,
             codec: "h264".to_string(),
         }
     }

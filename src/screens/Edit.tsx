@@ -26,6 +26,11 @@ interface ProjectListItem {
   modifiedTimeMs: number;
 }
 
+interface EditScreenProps {
+  onDirtyChange?: (dirty: boolean) => void;
+  onSaveHandlerChange?: (handler: (() => Promise<boolean>) | null) => void;
+}
+
 interface CursorSample {
   ts: number;
   x: number;
@@ -170,6 +175,43 @@ function VolumeIcon({ muted }: { muted: boolean }) {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+type TimeRangeMs = { startTs: number; endTs: number };
+
+function normalizeTimeRanges(rawRanges: Array<{ startTs: number; endTs: number }> | undefined): TimeRangeMs[] {
+  if (!rawRanges || rawRanges.length === 0) {
+    return [];
+  }
+  const sorted = rawRanges
+    .map((range) => ({
+      startTs: Math.max(0, Math.floor(range.startTs)),
+      endTs: Math.max(0, Math.floor(range.endTs)),
+    }))
+    .filter((range) => range.endTs > range.startTs)
+    .sort((left, right) => left.startTs - right.startTs);
+  const merged: TimeRangeMs[] = [];
+  for (const range of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && range.startTs <= last.endTs) {
+      last.endTs = Math.max(last.endTs, range.endTs);
+      continue;
+    }
+    merged.push({ ...range });
+  }
+  return merged;
+}
+
+function isTsInRanges(ts: number, ranges: TimeRangeMs[]): boolean {
+  for (const range of ranges) {
+    if (ts < range.startTs) {
+      return false;
+    }
+    if (ts >= range.startTs && ts < range.endTs) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isExpectedPlaybackAbort(err: unknown): boolean {
@@ -1107,7 +1149,11 @@ function chooseMarkerStepMs(pxPerMs: number): number {
   return 60_000;
 }
 
-export default function EditScreen() {
+function serializeProjectSnapshot(project: Project): string {
+  return JSON.stringify(project);
+}
+
+export default function EditScreen({ onDirtyChange, onSaveHandlerChange }: EditScreenProps) {
   const [projects, setProjects] = useState<ProjectListItem[]>([]);
   const [project, setProject] = useState<Project | null>(null);
   const [eventsFile, setEventsFile] = useState<EventsFile | null>(null);
@@ -1143,6 +1189,7 @@ export default function EditScreen() {
   const lastStateSyncAtRef = useRef(0);
   const playbackClockRef = useRef<{ anchorPerfMs: number; anchorPreviewMs: number } | null>(null);
   const playRequestSeqRef = useRef(0);
+  const savedProjectSnapshotRef = useRef<string | null>(null);
 
   const timelineDurationMs = project?.durationMs ?? 0;
   const previewDurationMs = useMemo(() => {
@@ -1250,6 +1297,10 @@ export default function EditScreen() {
     [eventsFile, project?.settings.cursor.smoothingFactor]
   );
   const clickTimestamps = useMemo(() => extractClickTimestamps(eventsFile), [eventsFile]);
+  const cursorHiddenRanges = useMemo(
+    () => normalizeTimeRanges(project?.settings.cursor.hiddenRanges),
+    [project?.settings.cursor.hiddenRanges]
+  );
   const runtimeSegments = useMemo(
     () =>
       toRuntimeSegments(
@@ -1332,18 +1383,23 @@ export default function EditScreen() {
       }
 
       if (cursorRef.current) {
-        const cursor = interpolateCursor(cursorSamples, cursorTimelineMs);
-        const cursorVideoX = cursor.x * previewFrameSize.width;
-        const cursorVideoY = cursor.y * previewFrameSize.height;
-        const cursorX = cursorVideoX * scale + txPx;
-        const cursorY = cursorVideoY * scale + tyPx;
-        const cursorPulseScale = sampleClickPulseScale(clickTimestamps, cursorTimelineMs);
-        const cursorScale = Math.max(0.25, scale) * cursorPulseScale;
-        const topLeftX = cursorX - previewCursorHotspotPx.x;
-        const topLeftY = cursorY - previewCursorHotspotPx.y;
-        cursorRef.current.style.transform = `translate3d(${topLeftX.toFixed(
-          3
-        )}px, ${topLeftY.toFixed(3)}px, 0) scale(${cursorScale.toFixed(4)})`;
+        if (isTsInRanges(cursorTimelineMs, cursorHiddenRanges)) {
+          cursorRef.current.style.display = "none";
+        } else {
+          cursorRef.current.style.display = "block";
+          const cursor = interpolateCursor(cursorSamples, cursorTimelineMs);
+          const cursorVideoX = cursor.x * previewFrameSize.width;
+          const cursorVideoY = cursor.y * previewFrameSize.height;
+          const cursorX = cursorVideoX * scale + txPx;
+          const cursorY = cursorVideoY * scale + tyPx;
+          const cursorPulseScale = sampleClickPulseScale(clickTimestamps, cursorTimelineMs);
+          const cursorScale = Math.max(0.25, scale) * cursorPulseScale;
+          const topLeftX = cursorX - previewCursorHotspotPx.x;
+          const topLeftY = cursorY - previewCursorHotspotPx.y;
+          cursorRef.current.style.transform = `translate3d(${topLeftX.toFixed(
+            3
+          )}px, ${topLeftY.toFixed(3)}px, 0) scale(${cursorScale.toFixed(4)})`;
+        }
       }
 
       if (timelinePlayheadRef.current) {
@@ -1357,6 +1413,7 @@ export default function EditScreen() {
     },
     [
       clickTimestamps,
+      cursorHiddenRanges,
       cursorSamples,
       previewCameraTrack,
       previewDurationMs,
@@ -1505,13 +1562,16 @@ export default function EditScreen() {
       }
 
       const sorted = sortSegments(loaded.timeline.zoomSegments);
-      setProject({
+      const normalizedProject: Project = {
         ...loaded,
         timeline: {
           ...loaded.timeline,
           zoomSegments: sorted,
         },
-      });
+      };
+      savedProjectSnapshotRef.current = serializeProjectSnapshot(normalizedProject);
+      onDirtyChange?.(false);
+      setProject(normalizedProject);
       setEventsFile(loadedEvents);
       setSelectedSegmentId(sorted[0]?.id ?? null);
       playheadRef.current = 0;
@@ -1524,6 +1584,8 @@ export default function EditScreen() {
     } catch (err) {
       setError(String(err));
       setProject(null);
+      savedProjectSnapshotRef.current = null;
+      onDirtyChange?.(false);
       setEventsFile(null);
       setSelectedSegmentId(null);
     } finally {
@@ -1541,6 +1603,8 @@ export default function EditScreen() {
       if (listed.length === 0) {
         if (autoLoadLatest) {
           setProject(null);
+          savedProjectSnapshotRef.current = null;
+          onDirtyChange?.(false);
           setEventsFile(null);
           setLoadedProjectPath(null);
           setSelectedSegmentId(null);
@@ -1855,9 +1919,9 @@ export default function EditScreen() {
     };
   }, [previewDurationMs, timelineDurationMs, pxPerPreviewMs]);
 
-  const handleSaveProject = async () => {
+  const saveProjectInternal = useCallback(async (): Promise<boolean> => {
     if (!project) {
-      return;
+      return true;
     }
     setError(null);
     setIsSaving(true);
@@ -1891,14 +1955,44 @@ export default function EditScreen() {
         projectPath: loadedProjectPath,
       });
       setProject(projectForSave);
+      savedProjectSnapshotRef.current = serializeProjectSnapshot(projectForSave);
+      onDirtyChange?.(false);
       setLoadedProjectPath(savedPath);
       await refreshProjects(false);
+      return true;
     } catch (err) {
       setError(String(err));
+      return false;
     } finally {
       setIsSaving(false);
     }
-  };
+  }, [loadedProjectPath, onDirtyChange, project, refreshProjects, runtimeSegments]);
+
+  const handleSaveProject = useCallback(async () => {
+    await saveProjectInternal();
+  }, [saveProjectInternal]);
+
+  useEffect(() => {
+    if (!onDirtyChange) {
+      return;
+    }
+    const snapshot = savedProjectSnapshotRef.current;
+    if (!project || !snapshot) {
+      onDirtyChange(false);
+      return;
+    }
+    onDirtyChange(serializeProjectSnapshot(project) !== snapshot);
+  }, [onDirtyChange, project]);
+
+  useEffect(() => {
+    if (!onSaveHandlerChange) {
+      return;
+    }
+    onSaveHandlerChange(project ? saveProjectInternal : null);
+    return () => {
+      onSaveHandlerChange(null);
+    };
+  }, [onSaveHandlerChange, project, saveProjectInternal]);
 
   const handleAddSegment = () => {
     if (!project) {

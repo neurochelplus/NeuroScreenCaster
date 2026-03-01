@@ -87,6 +87,7 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
   const [selectedMicrophoneDevice, setSelectedMicrophoneDevice] = useState("");
   const [isLoadingMicrophones, setIsLoadingMicrophones] = useState(false);
   const [microphoneError, setMicrophoneError] = useState<string | null>(null);
+  const [showCursor, setShowCursor] = useState(true);
 
   const tickerRef = useRef<number | null>(null);
   const elapsedBeforePauseMsRef = useRef(0);
@@ -158,7 +159,7 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
     }
 
     const monitor = await primaryMonitor();
-    const overlayWidth = 320;
+    const overlayWidth = 372;
     const overlayHeight = 60;
     const bottomGap = 24;
     const scaleFactor = monitor?.scaleFactor ?? 1;
@@ -205,7 +206,8 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
       nextState: RecordState,
       nextDuration: number,
       nextRecordingId: string | null,
-      hidden: boolean
+      hidden: boolean,
+      nextShowCursor: boolean
     ) => {
       if (nextState === "idle") {
         await closeOverlayWindow();
@@ -233,6 +235,7 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
         state: nextState,
         duration: nextDuration,
         hidden,
+        showCursor: nextShowCursor,
       };
       await getCurrentWebviewWindow().emitTo(
         overlayWindow.label,
@@ -404,10 +407,10 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
   }, [pullCtrlState, state, stopCtrlPolling]);
 
   useEffect(() => {
-    void emitOverlayUpdate(state, duration, recordingId, isCtrlPressed).catch(() => {
+    void emitOverlayUpdate(state, duration, recordingId, isCtrlPressed, showCursor).catch(() => {
       // Overlay is optional; ignore delivery errors.
     });
-  }, [duration, emitOverlayUpdate, isCtrlPressed, recordingId, state]);
+  }, [duration, emitOverlayUpdate, isCtrlPressed, recordingId, showCursor, state]);
 
   useEffect(() => {
     return () => {
@@ -431,6 +434,7 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
     setError(null);
     finalizeElapsedBeforePause();
     setDuration(0);
+    setShowCursor(true);
     elapsedBeforePauseMsRef.current = 0;
     resumedAtMsRef.current = null;
     const requiresMicrophone =
@@ -519,6 +523,7 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
     try {
       await invoke("stop_recording", { recordingId });
       setRecordingId(null);
+      setShowCursor(true);
       setState("idle");
       elapsedBeforePauseMsRef.current = 0;
       resumedAtMsRef.current = null;
@@ -528,6 +533,24 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
       setError(String(err));
     }
   }, [finalizeElapsedBeforePause, recordingId, state, stopTicker]);
+
+  const handleSetCursorVisibility = useCallback(
+    async (nextShowCursor: boolean) => {
+      if (!recordingId || state === "idle" || state === "stopping") {
+        return;
+      }
+      try {
+        await invoke("set_recording_cursor_visibility", {
+          recordingId,
+          visible: nextShowCursor,
+        });
+        setShowCursor(nextShowCursor);
+      } catch (err) {
+        setError(String(err));
+      }
+    },
+    [recordingId, state]
+  );
 
   useEffect(() => {
     const appWindow = getCurrentWebviewWindow();
@@ -544,6 +567,10 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
         }
         if (event.payload.action === "stop") {
           void handleStop();
+          return;
+        }
+        if (event.payload.action === "set-cursor-visible") {
+          void handleSetCursorVisibility(Boolean(event.payload.showCursor));
         }
       }
     );
@@ -553,7 +580,7 @@ export default function RecordScreen({ isActive }: RecordScreenProps) {
         unlisten();
       });
     };
-  }, [handlePause, handleResume, handleStop]);
+  }, [handlePause, handleResume, handleSetCursorVisibility, handleStop]);
 
   const isIdle = state === "idle";
   const microphoneSelectionVisible =

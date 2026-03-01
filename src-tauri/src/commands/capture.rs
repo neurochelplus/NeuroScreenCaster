@@ -22,7 +22,8 @@ use crate::capture::state::{
 };
 use crate::models::events::{EventsFile, InputEvent, SCHEMA_VERSION as EVENTS_VERSION};
 use crate::models::project::{
-    Project, ProjectSettings, Timeline, SCHEMA_VERSION as PROJECT_VERSION,
+    NormalizedRect, Project, ProjectSettings, TargetPoint, Timeline, ZoomSegment,
+    SCHEMA_VERSION as PROJECT_VERSION,
 };
 use crate::telemetry::logger::{self, TelemetryState};
 use serde::Deserialize;
@@ -231,6 +232,9 @@ pub async fn start_recording(
         start_ms,
         pause_started_at_ms: None,
         pause_ranges_ms: Vec::new(),
+        cursor_visible: true,
+        cursor_hidden_started_at_ms: None,
+        cursor_hidden_ranges_abs_ms: Vec::new(),
         auto_zoom_trigger_mode,
         audio_mode,
         microphone_device,
@@ -264,6 +268,10 @@ pub async fn stop_recording(
     if let Some(pause_started_at_ms) = rec.pause_started_at_ms.take() {
         rec.pause_ranges_ms.push((pause_started_at_ms, end_ms));
     }
+    if let Some(hidden_started_at_ms) = rec.cursor_hidden_started_at_ms.take() {
+        rec.cursor_hidden_ranges_abs_ms
+            .push((hidden_started_at_ms, end_ms));
+    }
     rec.pause_flag.store(false, Ordering::Relaxed);
     rec.stop_flag.store(true, Ordering::Relaxed);
     logger::set_paused(&telemetry.0, false);
@@ -279,6 +287,7 @@ pub async fn stop_recording(
     let microphone_device = rec.microphone_device.clone();
     let mut audio_capture_session = rec.audio_capture_session.take();
     let pause_ranges_ms = rec.pause_ranges_ms.clone();
+    let cursor_hidden_ranges_abs_ms = rec.cursor_hidden_ranges_abs_ms.clone();
     let paused_total_ms = total_pause_duration_ms(&pause_ranges_ms);
 
     let stop_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -313,6 +322,7 @@ pub async fn stop_recording(
             microphone_device,
             end_ms,
             pause_ranges_ms.clone(),
+            cursor_hidden_ranges_abs_ms.clone(),
             audio_capture_session.take(),
             telemetry_events,
         )?;
@@ -385,6 +395,42 @@ pub async fn resume_recording(
     }
     rec.pause_flag.store(false, Ordering::Relaxed);
     logger::set_paused(&telemetry.0, false);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_recording_cursor_visibility(
+    state: tauri::State<'_, RecorderState>,
+    recording_id: String,
+    visible: bool,
+) -> Result<(), String> {
+    let mut guard = state.0.lock().await;
+    let rec = guard.as_mut().ok_or("No active recording")?;
+    if rec.recording_id != recording_id {
+        return Err(format!(
+            "Recording ID mismatch: active={}, requested={recording_id}",
+            rec.recording_id
+        ));
+    }
+
+    if rec.cursor_visible == visible {
+        return Ok(());
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    if visible {
+        if let Some(hidden_started_at_ms) = rec.cursor_hidden_started_at_ms.take() {
+            if now_ms > hidden_started_at_ms {
+                rec.cursor_hidden_ranges_abs_ms
+                    .push((hidden_started_at_ms, now_ms));
+            }
+        }
+        rec.cursor_visible = true;
+    } else {
+        rec.cursor_visible = false;
+        rec.cursor_hidden_started_at_ms = Some(now_ms);
+    }
+
     Ok(())
 }
 
@@ -518,6 +564,257 @@ fn set_event_ts(event: &mut InputEvent, ts: u64) {
             *event_ts = ts;
         }
     }
+}
+
+fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort_by_key(|(start, _)| *start);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges.into_iter().filter(|(start, end)| end > start) {
+        if let Some((_, last_end)) = merged.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+fn paused_before_ts(ts: u64, merged_pauses: &[(u64, u64)]) -> u64 {
+    let mut paused = 0u64;
+    for (start, end) in merged_pauses {
+        if ts <= *start {
+            break;
+        }
+        let upper = ts.min(*end);
+        if upper > *start {
+            paused = paused.saturating_add(upper - *start);
+        }
+        if ts <= *end {
+            break;
+        }
+    }
+    paused
+}
+
+fn normalize_time_ranges_for_pauses(
+    ranges_abs_ms: &[(u64, u64)],
+    start_ms: u64,
+    pause_ranges_abs_ms: &[(u64, u64)],
+    end_ms: u64,
+) -> Vec<(u64, u64)> {
+    if ranges_abs_ms.is_empty() || end_ms <= start_ms {
+        return Vec::new();
+    }
+
+    let total_ms = end_ms.saturating_sub(start_ms);
+    let mut ranges = merge_ranges(
+        ranges_abs_ms
+            .iter()
+            .map(|(start, end)| {
+                (
+                    start.saturating_sub(start_ms).min(total_ms),
+                    end.saturating_sub(start_ms).min(total_ms),
+                )
+            })
+            .collect(),
+    );
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+
+    let pauses = merge_ranges(
+        pause_ranges_abs_ms
+            .iter()
+            .map(|(start, end)| {
+                (
+                    start.saturating_sub(start_ms).min(total_ms),
+                    end.saturating_sub(start_ms).min(total_ms),
+                )
+            })
+            .collect(),
+    );
+    if pauses.is_empty() {
+        return ranges;
+    }
+
+    let mut active_chunks_raw: Vec<(u64, u64)> = Vec::new();
+    for (range_start, range_end) in ranges.drain(..) {
+        let mut cursor = range_start;
+        for (pause_start, pause_end) in &pauses {
+            if *pause_end <= cursor {
+                continue;
+            }
+            if *pause_start >= range_end {
+                break;
+            }
+            if *pause_start > cursor {
+                active_chunks_raw.push((cursor, (*pause_start).min(range_end)));
+            }
+            cursor = cursor.max((*pause_end).min(range_end));
+            if cursor >= range_end {
+                break;
+            }
+        }
+        if cursor < range_end {
+            active_chunks_raw.push((cursor, range_end));
+        }
+    }
+
+    let normalized = active_chunks_raw
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let norm_start = start.saturating_sub(paused_before_ts(start, &pauses));
+            let norm_end = end.saturating_sub(paused_before_ts(end, &pauses));
+            (norm_end > norm_start).then_some((norm_start, norm_end))
+        })
+        .collect::<Vec<_>>();
+    merge_ranges(normalized)
+}
+
+fn is_ts_inside_ranges(ts: u64, ranges: &[(u64, u64)]) -> bool {
+    ranges.iter().any(|(start, end)| ts >= *start && ts < *end)
+}
+
+fn suppress_for_auto_zoom(event: &InputEvent) -> bool {
+    matches!(event, InputEvent::Click { .. })
+}
+
+fn filter_events_outside_ranges(
+    events: &[InputEvent],
+    ranges: &[(u64, u64)],
+    should_filter: fn(&InputEvent) -> bool,
+) -> Vec<InputEvent> {
+    if ranges.is_empty() {
+        return events.to_vec();
+    }
+    events
+        .iter()
+        .filter(|event| !(should_filter(event) && is_ts_inside_ranges(event.ts(), ranges)))
+        .cloned()
+        .collect()
+}
+
+fn sample_segment_rect_at_ts(segment: &ZoomSegment, ts: u64) -> NormalizedRect {
+    let mut rect = segment.initial_rect.clone();
+    for point in &segment.target_points {
+        if point.ts > ts {
+            break;
+        }
+        rect = point.rect.clone();
+    }
+    rect
+}
+
+fn crop_segment_target_points(
+    segment: &ZoomSegment,
+    start_ts: u64,
+    end_ts: u64,
+) -> Vec<TargetPoint> {
+    let mut points = Vec::new();
+    points.push(TargetPoint {
+        ts: start_ts,
+        rect: sample_segment_rect_at_ts(segment, start_ts),
+    });
+
+    for point in &segment.target_points {
+        if point.ts <= start_ts || point.ts >= end_ts {
+            continue;
+        }
+        points.push(point.clone());
+    }
+
+    if end_ts > start_ts {
+        points.push(TargetPoint {
+            ts: end_ts,
+            rect: sample_segment_rect_at_ts(segment, end_ts),
+        });
+    }
+
+    points.sort_by_key(|point| point.ts);
+    points.dedup_by(|left, right| left.ts == right.ts);
+    points
+}
+
+fn subtract_ranges_from_interval(
+    start_ts: u64,
+    end_ts: u64,
+    blocked_ranges: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
+    if end_ts <= start_ts {
+        return Vec::new();
+    }
+    if blocked_ranges.is_empty() {
+        return vec![(start_ts, end_ts)];
+    }
+
+    let mut fragments = vec![(start_ts, end_ts)];
+    for (block_start, block_end) in blocked_ranges {
+        if *block_end <= *block_start {
+            continue;
+        }
+        let mut next_fragments = Vec::new();
+        for (frag_start, frag_end) in fragments {
+            if *block_end <= frag_start || *block_start >= frag_end {
+                next_fragments.push((frag_start, frag_end));
+                continue;
+            }
+            if *block_start > frag_start {
+                next_fragments.push((frag_start, (*block_start).min(frag_end)));
+            }
+            if *block_end < frag_end {
+                next_fragments.push(((*block_end).max(frag_start), frag_end));
+            }
+        }
+        fragments = next_fragments;
+        if fragments.is_empty() {
+            break;
+        }
+    }
+    fragments
+        .into_iter()
+        .filter(|(start, end)| end > start)
+        .collect()
+}
+
+fn suppress_zoom_segments_in_ranges(
+    segments: Vec<ZoomSegment>,
+    blocked_ranges: &[(u64, u64)],
+) -> Vec<ZoomSegment> {
+    if blocked_ranges.is_empty() {
+        return segments;
+    }
+
+    let blocked = merge_ranges(blocked_ranges.to_vec());
+    let mut result = Vec::new();
+
+    for segment in segments {
+        let fragments = subtract_ranges_from_interval(segment.start_ts, segment.end_ts, &blocked);
+        for (index, (start_ts, end_ts)) in fragments.into_iter().enumerate() {
+            if end_ts <= start_ts {
+                continue;
+            }
+            let mut fragment = segment.clone();
+            fragment.id = format!("{}-{}", fragment.id, index + 1);
+            fragment.start_ts = start_ts;
+            fragment.end_ts = end_ts;
+            fragment.initial_rect = sample_segment_rect_at_ts(&segment, start_ts);
+            fragment.target_points = crop_segment_target_points(&segment, start_ts, end_ts);
+            result.push(fragment);
+        }
+    }
+
+    result.sort_by_key(|segment| segment.start_ts);
+    for (idx, segment) in result.iter_mut().enumerate() {
+        if segment.is_auto {
+            segment.id = format!("auto-{}", idx + 1);
+        }
+    }
+    result
 }
 
 fn list_dshow_audio_devices() -> Result<Vec<String>, String> {
@@ -1180,6 +1477,7 @@ fn save_recording_files(
     microphone_device: Option<String>,
     end_ms: u64,
     pause_ranges_ms: Vec<(u64, u64)>,
+    cursor_hidden_ranges_abs_ms: Vec<(u64, u64)>,
     mut audio_capture_session: Option<AudioCaptureSession>,
     events: Vec<InputEvent>,
 ) -> Result<(), String> {
@@ -1194,17 +1492,33 @@ fn save_recording_files(
         log::warn!("save_recording_files: audio finalize failed: {err}");
     }
 
-    let settings = ProjectSettings::default();
+    let mut settings = ProjectSettings::default();
     let output_aspect_ratio = settings.export.width as f64 / settings.export.height.max(1) as f64;
     let camera_config = camera_config_for_trigger_mode(auto_zoom_trigger_mode);
+    let cursor_hidden_ranges = normalize_time_ranges_for_pauses(
+        &cursor_hidden_ranges_abs_ms,
+        start_ms,
+        &pause_ranges_ms,
+        end_ms,
+    );
+    let zoom_events =
+        filter_events_outside_ranges(&events, &cursor_hidden_ranges, suppress_for_auto_zoom);
     let zoom_segments = camera_engine::build_smart_camera_segments(
-        &events,
+        &zoom_events,
         width,
         height,
         duration_ms,
         output_aspect_ratio,
         &camera_config,
     );
+    let zoom_segments = suppress_zoom_segments_in_ranges(zoom_segments, &cursor_hidden_ranges);
+    settings.cursor.hidden_ranges = cursor_hidden_ranges
+        .iter()
+        .map(|(start_ts, end_ts)| crate::models::project::TimeRange {
+            start_ts: *start_ts,
+            end_ts: *end_ts,
+        })
+        .collect();
     let smoothed_cursor_path =
         cursor_smoothing::smooth_cursor_path(&events, settings.cursor.smoothing_factor);
     let proxy_video_path = match build_editor_proxy(output_dir) {

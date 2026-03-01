@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState, type ReactElement } from "react";
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Screen } from "../App";
 import "./Navigation.css";
 
 interface NavigationProps {
   currentScreen: Screen;
   onNavigate: (screen: Screen) => void;
+  onRequestClose?: () => void;
 }
 
 interface NavItem {
@@ -92,8 +93,8 @@ const NAV_ITEMS: NavItem[] = [
   { id: "export", label: "Export", hint: "Render", icon: <ExportIcon /> },
 ];
 
-export default function Navigation({ currentScreen, onNavigate }: NavigationProps) {
-  const appWindow = getCurrentWebviewWindow();
+export default function Navigation({ currentScreen, onNavigate, onRequestClose }: NavigationProps) {
+  const appWindow = getCurrentWindow();
   const [isMaximized, setIsMaximized] = useState(false);
 
   const syncMaximizedState = useCallback(async () => {
@@ -128,8 +129,12 @@ export default function Navigation({ currentScreen, onNavigate }: NavigationProp
   }, [appWindow, syncMaximizedState]);
 
   const handleClose = useCallback(() => {
+    if (onRequestClose) {
+      onRequestClose();
+      return;
+    }
     void appWindow.close();
-  }, [appWindow]);
+  }, [appWindow, onRequestClose]);
 
   return (
     <nav className="nav">

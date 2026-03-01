@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { join } from "@tauri-apps/api/path";
 import type { Project } from "../types/project";
@@ -27,6 +27,7 @@ interface ExportStatus {
 }
 
 const CODEC_OPTIONS = ["h264", "h265", "vp9"] as const;
+const EXPORT_LAST_OUTPUT_DIR_KEY = "nsc.export.lastOutputDirectory";
 
 const DEFAULT_STATUS: ExportStatus = {
   isRunning: false,
@@ -75,9 +76,15 @@ export default function ExportScreen() {
   const [selectedProjectName, setSelectedProjectName] = useState<string>("");
   const [width, setWidth] = useState(1920);
   const [height, setHeight] = useState(1080);
-  const [fps, setFps] = useState(30);
+  const [fps, setFps] = useState(60);
   const [codec, setCodec] = useState<(typeof CODEC_OPTIONS)[number]>("h264");
-  const [outputDirectory, setOutputDirectory] = useState("");
+  const [outputDirectory, setOutputDirectory] = useState(() => {
+    try {
+      return window.localStorage.getItem(EXPORT_LAST_OUTPUT_DIR_KEY) ?? "";
+    } catch {
+      return "";
+    }
+  });
   const [outputFileName, setOutputFileName] = useState("");
   const [status, setStatus] = useState<ExportStatus>(DEFAULT_STATUS);
   const [isRefreshingProjects, setIsRefreshingProjects] = useState(false);
@@ -87,6 +94,20 @@ export default function ExportScreen() {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+
+  const setOutputDirectoryPersisted = useCallback((nextDirectory: string) => {
+    setOutputDirectory(nextDirectory);
+    try {
+      const trimmed = nextDirectory.trim();
+      if (!trimmed) {
+        window.localStorage.removeItem(EXPORT_LAST_OUTPUT_DIR_KEY);
+      } else {
+        window.localStorage.setItem(EXPORT_LAST_OUTPUT_DIR_KEY, trimmed);
+      }
+    } catch {
+      // Persist is best-effort.
+    }
+  }, []);
 
   const progressPercentPrecise = useMemo(
     () => Math.min(Math.max(status.progress, 0), 1) * 100,
@@ -126,7 +147,9 @@ export default function ExportScreen() {
         const latest = listed[0];
         setSelectedProjectPath(latest.projectPath);
         setSelectedProjectName(latest.name);
-        setOutputDirectory(latest.folderPath);
+        if (!outputDirectory.trim()) {
+          setOutputDirectoryPersisted(latest.folderPath);
+        }
         setOutputFileName(ensureMp4Extension(sanitizeFileName(latest.name) || "export"));
       }
     } catch (err) {
@@ -155,7 +178,6 @@ export default function ExportScreen() {
       });
       setWidth(loaded.settings.export.width);
       setHeight(loaded.settings.export.height);
-      setFps(loaded.settings.export.fps);
       const nextCodec = loaded.settings.export.codec.toLowerCase();
       setCodec(
         CODEC_OPTIONS.includes(nextCodec as (typeof CODEC_OPTIONS)[number])
@@ -265,7 +287,7 @@ export default function ExportScreen() {
     setSelectedProjectPath(projectPath);
     const found = projects.find((item) => item.projectPath === projectPath);
     if (found && !outputDirectory.trim()) {
-      setOutputDirectory(found.folderPath);
+      setOutputDirectoryPersisted(found.folderPath);
     }
   };
 
@@ -276,7 +298,7 @@ export default function ExportScreen() {
         initialDir: outputDirectory || null,
       });
       if (selected) {
-        setOutputDirectory(selected);
+        setOutputDirectoryPersisted(selected);
       }
     } catch (err) {
       setError(String(err));
@@ -409,7 +431,7 @@ export default function ExportScreen() {
                   <input
                     type="text"
                     value={outputDirectory}
-                    onChange={(event) => setOutputDirectory(event.target.value)}
+                    onChange={(event) => setOutputDirectoryPersisted(event.target.value)}
                     placeholder="D:\\Videos\\Exports"
                   />
                   <button className="btn-ghost" type="button" onClick={() => void handlePickOutputDirectory()}>

@@ -16,7 +16,8 @@ use crate::capture::recorder::{apply_no_window_flags, find_ffmpeg_exe};
 use crate::commands::cursor::resolve_cursor_asset_for_render;
 use crate::models::events::{EventsFile, InputEvent, SCHEMA_VERSION as EVENTS_SCHEMA_VERSION};
 use crate::models::project::{
-    CameraSpring, NormalizedRect, PanKeyframe, Project, TargetPoint, ZoomSegment, SCHEMA_VERSION,
+    CameraSpring, NormalizedRect, PanKeyframe, Project, TargetPoint, TimeRange, ZoomSegment,
+    SCHEMA_VERSION,
 };
 
 const DEFAULT_SPRING_MASS: f64 = 1.0;
@@ -561,8 +562,10 @@ fn execute_ffmpeg_export(
                 update_status(&progress_status, |status| {
                     if estimated > status.progress {
                         status.progress = estimated;
-                        status.message =
-                            format!("Exporting... {}% (estimated)", (estimated * 100.0).round() as u32);
+                        status.message = format!(
+                            "Exporting... {}% (estimated)",
+                            (estimated * 100.0).round() as u32
+                        );
                     }
                 });
             }
@@ -723,11 +726,18 @@ fn build_export_filter_graph(
     source_width: u32,
     source_height: u32,
 ) -> Result<(String, Option<PathBuf>, Option<PathBuf>), String> {
+    let project_duration_ms = project.duration_ms.max(1);
+    let cursor_hidden_ranges_ms = map_hidden_ranges_to_source(
+        &project.settings.cursor.hidden_ranges,
+        project_duration_ms,
+        source_duration_ms,
+    );
+
     let render_fps = target_fps as f64;
     let camera_states = build_camera_states(
         project,
         source_duration_ms,
-        project.duration_ms.max(1),
+        project_duration_ms,
         source_width.max(1),
         source_height.max(1),
         render_fps,
@@ -752,8 +762,9 @@ fn build_export_filter_graph(
             project,
             events,
             &camera_states,
+            &cursor_hidden_ranges_ms,
             source_duration_ms,
-            project.duration_ms.max(1),
+            project_duration_ms,
             source_width.max(1),
             source_height.max(1),
             target_width.max(1),
@@ -769,8 +780,9 @@ fn build_export_filter_graph(
                 project,
                 events_file,
                 &camera_states,
+                &cursor_hidden_ranges_ms,
                 source_duration_ms,
-                project.duration_ms.max(1),
+                project_duration_ms,
                 source_width.max(1),
                 source_height.max(1),
                 target_width.max(1),
@@ -1404,6 +1416,7 @@ fn build_cursor_overlay_plan(
     project: &Project,
     events: Option<&EventsFile>,
     camera_states: &[CameraState],
+    hidden_ranges_ms: &[(u64, u64)],
     source_duration_ms: u64,
     project_duration_ms: u64,
     source_width: u32,
@@ -1452,10 +1465,13 @@ fn build_cursor_overlay_plan(
         .events
         .iter()
         .filter_map(|event| match event {
-            InputEvent::Click { ts, .. } => Some(apply_cursor_timing_offset_ms(
-                map_time_ms(*ts, project_duration_ms, source_duration_ms),
-                source_duration_ms,
-            )),
+            InputEvent::Click { ts, .. } => {
+                let mapped = apply_cursor_timing_offset_ms(
+                    map_time_ms(*ts, project_duration_ms, source_duration_ms),
+                    source_duration_ms,
+                );
+                (!is_hidden_at(mapped, hidden_ranges_ms)).then_some(mapped)
+            }
             _ => None,
         })
         .collect();
@@ -1502,6 +1518,9 @@ fn build_cursor_overlay_plan(
         let frame_ms = ((frame as f64) * frame_step_ms)
             .round()
             .clamp(0.0, source_duration_ms as f64) as u64;
+        if is_hidden_at(frame_ms, hidden_ranges_ms) {
+            continue;
+        }
         let frame_no = frame as f64;
         let (src_x, src_y) = interpolate_cursor_position(&mapped_points, frame_ms);
         let zoom =
@@ -1525,6 +1544,9 @@ fn build_cursor_overlay_plan(
             src_x, src_y, zoom, offset_x, offset_y, src_w, src_h, dst_w, dst_h,
         );
         sampled.push((frame_ms, x, y));
+    }
+    if sampled.is_empty() {
+        return Ok(None);
     }
 
     sampled.dedup_by(|left, right| {
@@ -1586,6 +1608,7 @@ fn build_vector_cursor_ass_file(
     project: &Project,
     events_file: &EventsFile,
     camera_states: &[CameraState],
+    hidden_ranges_ms: &[(u64, u64)],
     source_duration_ms: u64,
     project_duration_ms: u64,
     source_width: u32,
@@ -1642,10 +1665,13 @@ fn build_vector_cursor_ass_file(
         .events
         .iter()
         .filter_map(|event| match event {
-            InputEvent::Click { ts, .. } => Some(apply_cursor_timing_offset_ms(
-                map_time_ms(*ts, project_duration_ms, source_duration_ms),
-                source_duration_ms,
-            )),
+            InputEvent::Click { ts, .. } => {
+                let mapped = apply_cursor_timing_offset_ms(
+                    map_time_ms(*ts, project_duration_ms, source_duration_ms),
+                    source_duration_ms,
+                );
+                (!is_hidden_at(mapped, hidden_ranges_ms)).then_some(mapped)
+            }
             _ => None,
         })
         .collect();
@@ -1659,6 +1685,9 @@ fn build_vector_cursor_ass_file(
         let frame_ms = ((frame as f64) * frame_step_ms)
             .round()
             .clamp(0.0, source_duration_ms as f64) as u64;
+        if is_hidden_at(frame_ms, hidden_ranges_ms) {
+            continue;
+        }
         let frame_no = (frame_ms as f64 / 1000.0) * render_fps.max(1.0);
         let (src_x, src_y) = interpolate_cursor_position(&mapped_points, frame_ms);
         let zoom = sample_camera_axis_value(
@@ -1704,6 +1733,9 @@ fn build_vector_cursor_ass_file(
         sampled.len(),
     );
     let sampled = decimate_cursor_samples_scaled(&sampled, vector_ass_budget);
+    if sampled.len() < 2 {
+        return Err("No visible cursor samples after hidden-range filtering".to_string());
+    }
 
     let target_min_side = target_width.min(target_height).max(1) as f64;
     let cursor_height_px =
@@ -1749,24 +1781,43 @@ fn build_vector_cursor_ass_file(
         if end_ms <= start_ms {
             continue;
         }
-        let scale_percent = cursor_scale_percent * start_scale;
-        let outline_px = cursor_outline_px * start_scale.clamp(0.75, 2.5);
+        for (visible_start_ms, visible_end_ms) in
+            visible_subranges(start_ms, end_ms, hidden_ranges_ms)
+        {
+            if visible_end_ms <= visible_start_ms {
+                continue;
+            }
 
-        writeln!(
-            file,
-            "Dialogue: 0,{},{},Cursor,,0,0,0,,{{\\an7\\p1\\fscx{:.2}\\fscy{:.2}\\bord{:.2}\\shad0\\move({},{},{},{})}}{}",
-            format_ass_time(start_ms),
-            format_ass_time(end_ms),
-            scale_percent,
-            scale_percent,
-            outline_px,
-            x1,
-            y1,
-            x2,
-            y2,
-            VECTOR_CURSOR_ASS_PATH
-        )
-        .map_err(|e| format!("Failed to write ass cursor event: {e}"))?;
+            let span_ms = (end_ms - start_ms).max(1);
+            let lerp = |a: i64, b: i64, ts: u64| -> i64 {
+                let t = (ts.saturating_sub(start_ms)) as f64 / span_ms as f64;
+                (a as f64 + (b as f64 - a as f64) * t).round() as i64
+            };
+
+            let vx1 = lerp(x1, x2, visible_start_ms);
+            let vy1 = lerp(y1, y2, visible_start_ms);
+            let vx2 = lerp(x1, x2, visible_end_ms);
+            let vy2 = lerp(y1, y2, visible_end_ms);
+
+            let scale_percent = cursor_scale_percent * start_scale;
+            let outline_px = cursor_outline_px * start_scale.clamp(0.75, 2.5);
+
+            writeln!(
+                file,
+                "Dialogue: 0,{},{},Cursor,,0,0,0,,{{\\an7\\p1\\fscx{:.2}\\fscy{:.2}\\bord{:.2}\\shad0\\move({},{},{},{})}}{}",
+                format_ass_time(visible_start_ms),
+                format_ass_time(visible_end_ms),
+                scale_percent,
+                scale_percent,
+                outline_px,
+                vx1,
+                vy1,
+                vx2,
+                vy2,
+                VECTOR_CURSOR_ASS_PATH
+            )
+            .map_err(|e| format!("Failed to write ass cursor event: {e}"))?;
+        }
     }
 
     Ok(ass_path)
@@ -2293,6 +2344,88 @@ fn apply_cursor_timing_offset_ms(ts_ms: u64, duration_ms: u64) -> u64 {
     ts_ms
         .saturating_add(CURSOR_TIMING_OFFSET_MS)
         .min(duration_ms)
+}
+
+fn merge_time_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort_by_key(|(start, _)| *start);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges.into_iter().filter(|(start, end)| end > start) {
+        if let Some((_, last_end)) = merged.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+fn map_hidden_ranges_to_source(
+    ranges: &[TimeRange],
+    project_duration_ms: u64,
+    source_duration_ms: u64,
+) -> Vec<(u64, u64)> {
+    if ranges.is_empty() || project_duration_ms == 0 || source_duration_ms == 0 {
+        return Vec::new();
+    }
+    let mapped = ranges
+        .iter()
+        .map(|range| {
+            (
+                map_time_ms(range.start_ts, project_duration_ms, source_duration_ms),
+                map_time_ms(range.end_ts, project_duration_ms, source_duration_ms),
+            )
+        })
+        .collect::<Vec<_>>();
+    merge_time_ranges(mapped)
+}
+
+fn is_hidden_at(ts_ms: u64, hidden_ranges_ms: &[(u64, u64)]) -> bool {
+    hidden_ranges_ms
+        .iter()
+        .any(|(start, end)| ts_ms >= *start && ts_ms < *end)
+}
+
+fn visible_subranges(
+    start_ms: u64,
+    end_ms: u64,
+    hidden_ranges_ms: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
+    if end_ms <= start_ms {
+        return Vec::new();
+    }
+    if hidden_ranges_ms.is_empty() {
+        return vec![(start_ms, end_ms)];
+    }
+
+    let mut out = vec![(start_ms, end_ms)];
+    for (hidden_start, hidden_end) in hidden_ranges_ms {
+        if *hidden_end <= *hidden_start {
+            continue;
+        }
+        let mut next = Vec::new();
+        for (frag_start, frag_end) in out {
+            if *hidden_end <= frag_start || *hidden_start >= frag_end {
+                next.push((frag_start, frag_end));
+                continue;
+            }
+            if *hidden_start > frag_start {
+                next.push((frag_start, (*hidden_start).min(frag_end)));
+            }
+            if *hidden_end < frag_end {
+                next.push(((*hidden_end).max(frag_start), frag_end));
+            }
+        }
+        out = next;
+        if out.is_empty() {
+            break;
+        }
+    }
+    out.into_iter().filter(|(s, e)| e > s).collect()
 }
 
 fn format_ass_time(ms: u64) -> String {

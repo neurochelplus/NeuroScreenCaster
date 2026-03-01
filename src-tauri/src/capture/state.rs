@@ -66,6 +66,12 @@ pub struct ActiveRecording {
     pub pause_started_at_ms: Option<u64>,
     /// Closed pause ranges (absolute Unix ms).
     pub pause_ranges_ms: Vec<(u64, u64)>,
+    /// True when cursor should be visible in preview/export.
+    pub cursor_visible: bool,
+    /// Active hidden-cursor interval start (absolute Unix ms).
+    pub cursor_hidden_started_at_ms: Option<u64>,
+    /// Closed hidden-cursor intervals (absolute Unix ms).
+    pub cursor_hidden_ranges_abs_ms: Vec<(u64, u64)>,
     /// Auto-zoom activation mode selected before recording start.
     pub auto_zoom_trigger_mode: AutoZoomTriggerMode,
     /// Audio capture mode selected before recording start.

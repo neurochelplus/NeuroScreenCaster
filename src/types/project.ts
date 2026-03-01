@@ -67,6 +67,13 @@ export interface CursorSettings {
   color: string;
   /** [0.0, 1.0] — сила сглаживания траектории. */
   smoothingFactor: number;
+  /** Интервалы таймлайна, где курсор скрыт. */
+  hiddenRanges?: TimeRange[];
+}
+
+export interface TimeRange {
+  startTs: number;
+  endTs: number;
 }
 
 export type Background =
@@ -111,7 +118,7 @@ export interface Project {
 // --- Фабрики / дефолты ---
 
 export function defaultCursorSettings(): CursorSettings {
-  return { size: 1.0, color: "#FFFFFF", smoothingFactor: 0.8 };
+  return { size: 1.0, color: "#FFFFFF", smoothingFactor: 0.8, hiddenRanges: [] };
 }
 
 export function defaultBackground(): Background {
@@ -119,7 +126,7 @@ export function defaultBackground(): Background {
 }
 
 export function defaultExportSettings(): ExportSettings {
-  return { width: 1920, height: 1080, fps: 30, codec: "h264" };
+  return { width: 1920, height: 1080, fps: 60, codec: "h264" };
 }
 
 export function defaultProjectSettings(): ProjectSettings {

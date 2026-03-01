@@ -72,6 +72,24 @@
   background: rgba(185, 28, 28, 0.95);
 }
 
+.recording-overlay-icon-btn--cursor-on {
+  background: rgba(34, 197, 94, 0.84);
+  border-color: rgba(134, 239, 172, 0.7);
+}
+
+.recording-overlay-icon-btn--cursor-on:hover:not(:disabled) {
+  background: rgba(22, 163, 74, 0.9);
+}
+
+.recording-overlay-icon-btn--cursor-off {
+  background: rgba(100, 116, 139, 0.38);
+  border-color: rgba(148, 163, 184, 0.52);
+}
+
+.recording-overlay-icon-btn--cursor-off:hover:not(:disabled) {
+  background: rgba(100, 116, 139, 0.52);
+}
+
 .recording-overlay-icon-btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;

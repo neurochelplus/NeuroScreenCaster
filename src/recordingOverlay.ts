@@ -9,10 +9,12 @@ export interface RecordingOverlayUpdatePayload {
   state: OverlayRecordingState;
   duration: number;
   hidden: boolean;
+  showCursor: boolean;
 }
 
-export type RecordingOverlayAction = "pause" | "resume" | "stop";
+export type RecordingOverlayAction = "pause" | "resume" | "stop" | "set-cursor-visible";
 
 export interface RecordingOverlayActionPayload {
   action: RecordingOverlayAction;
+  showCursor?: boolean;
 }

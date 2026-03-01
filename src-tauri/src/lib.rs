@@ -22,6 +22,7 @@ pub fn run() {
         .manage(ExportState::default())
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
+            commands::app::exit_application,
             commands::capture::start_native_preview,
             commands::capture::get_native_preview_frame,
             commands::capture::stop_native_preview,
@@ -31,6 +32,7 @@ pub fn run() {
             commands::capture::stop_recording,
             commands::capture::pause_recording,
             commands::capture::resume_recording,
+            commands::capture::set_recording_cursor_visibility,
             commands::cursor::get_cursor_asset_info,
             commands::export::start_export,
             commands::export::cancel_export,
